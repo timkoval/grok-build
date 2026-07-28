@@ -37,6 +37,11 @@
               with pkgs;
               [ openssl zlib ] ++ lib.optionals pkgs.stdenv.isLinux [ curl ];
 
+            # xai-grok-tools embeds ripgrep at build time (downloads it from
+            # GitHub releases).  In the Nix sandbox there's no network, so we
+            # point it at the nixpkgs ripgrep binary instead.
+            env.GROK_TOOLS_BUNDLE_RG_PATH = "${pkgs.ripgrep}/bin/rg";
+
             cargoBuildFlags = [ "-p" "xai-grok-pager-bin" ];
 
             doCheck = false;
