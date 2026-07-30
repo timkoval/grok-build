@@ -690,6 +690,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
             handle_mcp_server_status(notif, app)
         }
         "x.ai/mcp/servers_updated" => handle_mcp_servers_updated(notif, app),
+        "x.ai/config_changed" => handle_config_changed(notif, app),
         _ => false,
     }
 }
@@ -741,6 +742,63 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
         .scrollback
         .push_block(RenderBlock::interjection_prompt(text));
     is_active
+}
+
+/// Handle `x.ai/config_changed` — the leader broadcasts this when
+/// [`ConfigUpdate::Ui`](xai_grok_shell::config::reloader::ConfigUpdate::Ui)
+/// detects a change in the `[ui]` section of `config.toml`. Applies
+/// `theme`, `yolo` (`permission_mode`), and `fork_secondary_model`
+/// changes to the live [`UiConfig`] without restarting the TUI, and
+/// refreshes any open settings modals so the indicators stay in sync.
+fn handle_config_changed(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(notif.params.get()) else {
+        tracing::warn!("Failed to parse x.ai/config_changed");
+        return false;
+    };
+    let Some(section) = parsed.get("section").and_then(|v| v.as_str()) else {
+        tracing::warn!("x.ai/config_changed missing section");
+        return false;
+    };
+    if section != "ui" {
+        return false;
+    }
+    let Some(changes) = parsed.get("changes") else {
+        tracing::warn!("x.ai/config_changed missing changes");
+        return false;
+    };
+    let mut affected = false;
+
+    // Apply theme change if present (non-null, non-empty).
+    if let Some(theme) = changes.get("theme").and_then(|v| v.as_str()) {
+        if !theme.is_empty() {
+            use super::dispatch::set_theme_inner;
+            set_theme_inner(app, theme);
+            affected = true;
+        }
+    }
+
+    // Apply yolo / permission-mode change if present.
+    if let Some(yolo) = changes.get("yolo").and_then(|v| v.as_bool()) {
+        use super::dispatch::set_yolo_mode_inner;
+        set_yolo_mode_inner(app, yolo);
+        affected = true;
+    }
+
+    // Apply fork_secondary_model change if present (non-null, non-empty).
+    if let Some(fsm) = changes.get("fork_secondary_model").and_then(|v| v.as_str()) {
+        if !fsm.is_empty() {
+            use super::dispatch::set_fork_secondary_model_inner;
+            set_fork_secondary_model_inner(app, fsm.to_string());
+            affected = true;
+        }
+    }
+
+    if affected {
+        use super::dispatch::refresh_open_settings_modals;
+        refresh_open_settings_modals(app);
+    }
+
+    affected
 }
 
 /// Handle an ACP `ext_method` request (blocking request that expects a response).

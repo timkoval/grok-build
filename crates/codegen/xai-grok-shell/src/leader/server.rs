@@ -393,6 +393,7 @@ fn is_machine_wide_broadcast_notification(json: &serde_json::Value) -> bool {
                 | "x.ai/models/update"
                 | "x.ai/mcp/servers_updated"
                 | "x.ai/announcements/update"
+                | "x.ai/config_changed"
         )
     )
 }
@@ -6346,6 +6347,12 @@ mod tests {
         )));
         assert!(!is_machine_wide_broadcast_notification(&pv(
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s"}}"#
+        )));
+        assert!(is_machine_wide_broadcast_notification(&pv(
+            r#"{"jsonrpc":"2.0","method":"x.ai/config_changed","params":{}}"#
+        )));
+        assert!(is_machine_wide_broadcast_notification(&pv(
+            r#"{"jsonrpc":"2.0","method":"_x.ai/config_changed","params":{"method":"x.ai/config_changed","params":{"section":"ui","changes":{"theme":"dark"}}}}"#
         )));
         assert!(!is_machine_wide_broadcast_notification(&pv(
             r#"{"jsonrpc":"2.0","method":"x.ai/settings/update","params":{}}"#

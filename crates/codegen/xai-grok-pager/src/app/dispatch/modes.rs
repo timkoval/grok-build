@@ -273,7 +273,7 @@ pub(super) fn sync_active_auto_flag(app: &mut AppView) {
 
 /// State-only `permission_mode` (YOLO) mutation; also called from rollback.
 /// Flips to ON are refused while the pin is set.
-pub(super) fn set_yolo_mode_inner(app: &mut AppView, new: bool) {
+pub(crate) fn set_yolo_mode_inner(app: &mut AppView, new: bool) {
     if yolo_enable_blocked(app, new).is_some() {
         tracing::warn!("always-approve enable blocked by managed policy");
         return;

@@ -1270,7 +1270,7 @@ fn auto_theme_setting_is_live(key: &str) -> bool {
 /// snapshot and the visual revert. Unknown / unrecognised names log
 /// at `warn` (defensive — a malformed `rollback_value` is a softer
 /// failure mode than an unknown commit-time value) and no-op.
-pub(super) fn set_theme_inner(app: &mut AppView, value: &str) {
+pub(crate) fn set_theme_inner(app: &mut AppView, value: &str) {
     let Some(kind) = crate::theme::ThemeKind::from_name(value) else {
         tracing::warn!(
             target: "settings",
@@ -1812,7 +1812,7 @@ pub(in crate::app::dispatch) fn clear_default_model(app: &mut AppView) -> Vec<Ef
 /// `app.current_ui.fork_secondary_model` mirror so the modal
 /// indicator stays in sync; the shell's config-reloader propagates
 /// the disk change to any running agents on the next fork.
-pub(super) fn set_fork_secondary_model_inner(app: &mut AppView, value: String) {
+pub(crate) fn set_fork_secondary_model_inner(app: &mut AppView, value: String) {
     app.current_ui.fork_secondary_model = value;
 }
 
