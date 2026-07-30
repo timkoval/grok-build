@@ -1,0 +1,42 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/xai-org/grok-build.git || true
+          git fetch upstream main
+
+          # Check if there are new commits
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "Already up to date"
+            exit 0
+          fi
+
+          # Try merge
+          git merge upstream/main --no-edit || {
+            echo "::error::Merge conflict — manual resolution needed"
+            exit 1
+          }
+
+          git push origin main
+          echo "Synced to $(git rev-parse --short HEAD)"
