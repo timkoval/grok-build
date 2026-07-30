@@ -857,6 +857,22 @@ impl SamplingClient {
                     "Unauthorized (401): {server_message}"
                 )));
             }
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                tracing::warn!(
+                    status = %status,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
+            }
             let message = user_facing_api_error_message(status, bytes.as_ref());
             return Err(SamplingError::Api {
                 status,
@@ -1010,6 +1026,26 @@ impl SamplingClient {
                 )));
             }
 
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let bytes = response.bytes().await?;
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                span.record("error", "request timeout (408)");
+                tracing::warn!(
+                    status = %status,
+                    model_id = %model_id,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
+            }
+
             let bytes = response.bytes().await?;
             let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
@@ -1073,6 +1109,11 @@ impl SamplingClient {
 
                         if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Err(stream_error))
+                        } else if data.contains("\"x-opencode-type\"") {
+                            // OpenCode Go sends inference-cost metadata chunks
+                            // that don't conform to the OpenAI streaming format.
+                            tracing::debug!("Skipping non-standard SSE chunk (x-opencode-type)");
+                            None
                         } else {
                             Some(
                                 serde_json::from_str::<ChatCompletionChunk>(data).map_err(|e| {
@@ -1202,6 +1243,24 @@ impl SamplingClient {
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
+            }
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                tracing::warn!(
+                    status = %status,
+                    model_id = %model_id,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. \
+                         Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
             }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
@@ -1367,6 +1426,25 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                span.record("error", "request timeout (408)");
+                tracing::warn!(
+                    status = %status,
+                    model_id = %model_id,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. \
+                         Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
+            }
             let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
             tracing::error!(
@@ -1542,6 +1620,24 @@ impl SamplingClient {
                     "Unauthorized (401) from {endpoint}: {server_message}"
                 )));
             }
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                tracing::warn!(
+                    status = %status,
+                    model_id = %model_id,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. \
+                         Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
+            }
 
             let message = user_facing_api_error_message(status, bytes.as_ref());
             tracing::warn!(
@@ -1667,6 +1763,25 @@ impl SamplingClient {
             let retry_after_secs = extract_retry_after(response.headers());
             let should_retry = extract_should_retry(response.headers());
             let bytes = response.bytes().await?;
+            if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                span.record("error", "request timeout (408)");
+                tracing::warn!(
+                    status = %status,
+                    model_id = %model_id,
+                    "Request timed out (408) — the payload may be too large for the upstream server"
+                );
+                return Err(SamplingError::Api {
+                    status,
+                    message: format!(
+                        "Request timed out (408): the payload may be too large. \
+                         Consider reducing the request size or retrying. Server says: {server_message}"
+                    ),
+                    model_metadata,
+                    retry_after_secs,
+                    should_retry: Some(true),
+                });
+            }
             let message = user_facing_api_error_message(status, bytes.as_ref());
             span.record("error", message.as_str());
             tracing::error!(
@@ -1729,6 +1844,9 @@ impl SamplingClient {
 
                         if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Err(stream_error))
+                        } else if data.contains("\"x-opencode-type\"") {
+                            tracing::debug!("Skipping non-standard SSE chunk (x-opencode-type) [messages]");
+                            None
                         } else {
                             Some(
                                 serde_json::from_str::<messages::MessageStreamEvent>(data).map_err(

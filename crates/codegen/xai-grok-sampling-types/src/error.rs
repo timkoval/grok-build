@@ -189,6 +189,16 @@ impl SamplingError {
         )
     }
 
+    pub fn is_request_timeout(&self) -> bool {
+        matches!(
+            self,
+            SamplingError::Api {
+                status: StatusCode::REQUEST_TIMEOUT,
+                ..
+            }
+        )
+    }
+
     /// `true` when the error looks like a connection reset or broken pipe
     /// during request upload — the pattern nginx produces when it rejects an
     /// oversized payload by closing the connection instead of responding 413.
@@ -244,7 +254,7 @@ impl SamplingError {
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
             SamplingError::Api { status, .. } => {
-                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 520)
+                matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 520)
             }
             SamplingError::EventStreamError(_) => true,
             SamplingError::StreamError { .. } => true,
