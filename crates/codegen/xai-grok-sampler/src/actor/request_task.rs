@@ -518,6 +518,7 @@ async fn run_one_attempt(
                 idle_timeout,
                 doom_loop,
                 Arc::clone(&output_observed),
+                client.needs_output_item_backfill(),
             );
             drive_l2(
                 l2,

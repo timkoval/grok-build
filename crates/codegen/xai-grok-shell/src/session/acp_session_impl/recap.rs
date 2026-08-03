@@ -603,6 +603,7 @@ impl SessionActor {
                     request_id,
                     idle_timeout,
                     doom_loop,
+                    sampling_client.needs_output_item_backfill(),
                 );
                 xai_grok_sampler::collect_response(events).await
             }

@@ -38,6 +38,49 @@ pub use xai_grok_sampling_types::ApiBackend;
 /// Process-level fallback for the `x-grok-client-identifier` header.
 const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 
+/// Path marker of the Codex backend that fronts a ChatGPT OAuth login
+/// (`https://chatgpt.com/backend-api/codex`, and its staging/legacy hosts).
+/// Matched on the path rather than the host so every host spelling is covered.
+const CODEX_BACKEND_PATH_MARKER: &str = "/backend-api/codex";
+
+/// True for the ChatGPT-hosted Codex endpoint, which rejects a `system` role
+/// with `{"detail":"System messages are not allowed"}`. See
+/// [`rewrite_system_roles_to_developer`].
+fn is_codex_chatgpt_backend(base_url: &str) -> bool {
+    base_url.contains(CODEX_BACKEND_PATH_MARKER)
+}
+
+/// Rewrite `system` input roles to `developer` in place.
+///
+/// The ChatGPT-hosted Codex backend refuses a `system` role outright, but
+/// accepts `developer` — which sits at the same level of the Responses API's
+/// instruction-following hierarchy, so the prompt keeps its precedence over
+/// `user` content. The upstream Codex CLI sidesteps this by passing its prompt
+/// as top-level `instructions`; grok-build carries the system prompt as a
+/// conversation item (see `conversation_item_to_input_items`), so translating
+/// the role keeps that single representation intact.
+///
+/// Scoped to the Codex endpoint: every other Responses backend takes `system`.
+fn rewrite_system_roles_to_developer(input: &mut rs::InputParam) {
+    let rs::InputParam::Items(items) = input else {
+        // `InputParam::Text` is a bare user turn — no role to rewrite.
+        return;
+    };
+    for item in items.iter_mut() {
+        match item {
+            rs::InputItem::EasyMessage(message) if message.role == rs::Role::System => {
+                message.role = rs::Role::Developer;
+            }
+            rs::InputItem::Item(rs::Item::Message(rs::MessageItem::Input(message)))
+                if message.role == rs::InputRole::System =>
+            {
+                message.role = rs::InputRole::Developer;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
@@ -678,6 +721,15 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
+    /// Whether this endpoint delivers its final output only on
+    /// `response.output_item.done`, leaving the terminal event's `output`
+    /// empty — true for the ChatGPT-hosted Codex backend alone. Callers pass
+    /// this to the Responses stream transform, which otherwise trusts the
+    /// terminal event as the sole source of the final output.
+    pub fn needs_output_item_backfill(&self) -> bool {
+        is_codex_chatgpt_backend(&self.base_url)
+    }
+
     /// POST with default headers, returning the builder coupled to the tail
     /// fragment of the credential actually placed in its headers (`None` =
     /// no credential) — captured at build time because a record-time
@@ -1203,6 +1255,11 @@ impl SamplingClient {
         // Set store to false if not specified (default is true, but that breaks ZDR compliance)
         if request.inner.store.is_none() {
             request.inner.store = Some(false);
+        }
+
+        // The ChatGPT-hosted Codex backend rejects the `system` role.
+        if is_codex_chatgpt_backend(&self.base_url) {
+            rewrite_system_roles_to_developer(&mut request.inner.input);
         }
 
         // Include encrypted reasoning content if not specified
@@ -2162,8 +2219,14 @@ impl SamplingClient {
             }
             ApiBackend::Responses => {
                 let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
-                let events =
-                    crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
+                let events = crate::stream::stream_responses(
+                    raw,
+                    meta,
+                    request_id,
+                    idle_timeout,
+                    doom_loop,
+                    self.needs_output_item_backfill(),
+                );
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Messages => {
@@ -3065,5 +3128,162 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    // =========================================================================
+    // Codex (ChatGPT OAuth) backend: system -> developer role
+    // =========================================================================
+
+    const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+    #[test]
+    fn codex_backend_is_detected_by_path_marker_on_any_host() {
+        assert!(is_codex_chatgpt_backend(CODEX_BASE_URL));
+        assert!(is_codex_chatgpt_backend(
+            "https://chatgpt-staging.com/backend-api/codex"
+        ));
+        assert!(is_codex_chatgpt_backend(
+            "https://chat.openai.com/backend-api/codex"
+        ));
+        // The platform API takes an API key and accepts `system`.
+        assert!(!is_codex_chatgpt_backend("https://api.openai.com/v1"));
+        assert!(!is_codex_chatgpt_backend("https://api.x.ai/v1"));
+        // A neighbouring ChatGPT backend path is not the Codex endpoint.
+        assert!(!is_codex_chatgpt_backend(
+            "https://chatgpt.com/backend-api/conversation"
+        ));
+    }
+
+    #[test]
+    fn output_item_backfill_is_requested_only_for_the_codex_endpoint() {
+        assert!(responses_client(CODEX_BASE_URL).needs_output_item_backfill());
+        assert!(!responses_client("https://api.x.ai/v1").needs_output_item_backfill());
+        assert!(!responses_client("https://api.openai.com/v1").needs_output_item_backfill());
+    }
+
+    fn easy_message(role: rs::Role, text: &str) -> rs::InputItem {
+        rs::InputItem::EasyMessage(rs::EasyInputMessage {
+            r#type: rs::MessageType::Message,
+            role,
+            content: rs::EasyInputContent::Text(text.to_owned()),
+        })
+    }
+
+    fn easy_roles(input: &rs::InputParam) -> Vec<rs::Role> {
+        let rs::InputParam::Items(items) = input else {
+            panic!("expected item list");
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                rs::InputItem::EasyMessage(message) => Some(message.role),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Build a Responses-backend client pointed at `base_url`.
+    fn responses_client(base_url: &str) -> SamplingClient {
+        SamplingClient::new(SamplerConfig {
+            base_url: base_url.to_string(),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        })
+        .expect("client should build")
+    }
+
+    fn wrapper_with(items: Vec<rs::InputItem>) -> CreateResponseWrapper {
+        CreateResponseWrapper::new(rs::CreateResponse {
+            input: rs::InputParam::Items(items),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn codex_backend_rewrites_system_role_to_developer() {
+        let client = responses_client(CODEX_BASE_URL);
+        let mut request = wrapper_with(vec![
+            easy_message(rs::Role::System, "you are a coding agent"),
+            easy_message(rs::Role::User, "hello"),
+        ]);
+
+        client
+            .apply_response_defaults(&mut request)
+            .expect("defaults apply");
+
+        // The system prompt survives as `developer`; the user turn is untouched.
+        assert_eq!(
+            easy_roles(&request.inner.input),
+            vec![rs::Role::Developer, rs::Role::User]
+        );
+    }
+
+    #[test]
+    fn non_codex_backend_keeps_the_system_role() {
+        let client = responses_client("https://api.x.ai/v1");
+        let mut request = wrapper_with(vec![
+            easy_message(rs::Role::System, "you are a coding agent"),
+            easy_message(rs::Role::User, "hello"),
+        ]);
+
+        client
+            .apply_response_defaults(&mut request)
+            .expect("defaults apply");
+
+        assert_eq!(
+            easy_roles(&request.inner.input),
+            vec![rs::Role::System, rs::Role::User],
+            "only the Codex endpoint rejects `system`; other backends must not change"
+        );
+    }
+
+    #[test]
+    fn codex_rewrite_leaves_assistant_and_user_roles_alone() {
+        let mut input = rs::InputParam::Items(vec![
+            easy_message(rs::Role::User, "hello"),
+            easy_message(rs::Role::Assistant, "hi"),
+            easy_message(rs::Role::Developer, "already developer"),
+        ]);
+
+        rewrite_system_roles_to_developer(&mut input);
+
+        assert_eq!(
+            easy_roles(&input),
+            vec![rs::Role::User, rs::Role::Assistant, rs::Role::Developer]
+        );
+    }
+
+    #[test]
+    fn codex_rewrite_covers_structured_input_messages() {
+        // Reasoning/tool round-trips carry structured `InputMessage` items,
+        // which use their own role enum.
+        let mut input = rs::InputParam::Items(vec![rs::InputItem::Item(rs::Item::Message(
+            rs::MessageItem::Input(rs::InputMessage {
+                content: vec![rs::InputContent::InputText(rs::InputTextContent {
+                    text: "you are a coding agent".to_owned(),
+                })],
+                role: rs::InputRole::System,
+                status: None,
+            }),
+        ))]);
+
+        rewrite_system_roles_to_developer(&mut input);
+
+        let rs::InputParam::Items(items) = &input else {
+            panic!("expected item list");
+        };
+        let rs::InputItem::Item(rs::Item::Message(rs::MessageItem::Input(message))) = &items[0]
+        else {
+            panic!("expected a structured input message");
+        };
+        assert_eq!(message.role, rs::InputRole::Developer);
+    }
+
+    #[test]
+    fn codex_rewrite_ignores_a_bare_text_input() {
+        // `InputParam::Text` is a plain user turn with no role to rewrite.
+        let mut input = rs::InputParam::Text("hello".to_owned());
+        rewrite_system_roles_to_developer(&mut input);
+        assert_eq!(input, rs::InputParam::Text("hello".to_owned()));
     }
 }

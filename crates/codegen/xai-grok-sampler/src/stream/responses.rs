@@ -107,12 +107,19 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
 /// `SamplingClient::conversation_stream_responses`; any signals the SSE
 /// decoder recorded are drained onto the final `ConversationResponse`.
 /// `None` (check disabled) leaves the response untouched.
+///
+/// `backfill_output_from_items` opts into reconstructing the final `output`
+/// from `response.output_item.done` when the terminal event carries none.
+/// Pass [`SamplingClient::needs_output_item_backfill`](crate::client::SamplingClient::needs_output_item_backfill),
+/// which is true for the ChatGPT-hosted Codex endpoint alone; every other
+/// backend owns its final output on the terminal event and must stay untouched.
 pub fn stream_responses<'a>(
     raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
     request_id: RequestId,
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+    backfill_output_from_items: bool,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     stream_responses_tracked(
         raw_stream,
@@ -121,6 +128,7 @@ pub fn stream_responses<'a>(
         idle_timeout,
         doom_loop,
         Arc::new(AtomicBool::new(false)),
+        backfill_output_from_items,
     )
 }
 
@@ -131,6 +139,7 @@ pub(crate) fn stream_responses_tracked<'a>(
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     output_observed: Arc<AtomicBool>,
+    backfill_output_from_items: bool,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
@@ -151,6 +160,10 @@ pub(crate) fn stream_responses_tracked<'a>(
         }
 
         let mut final_response: Option<rs::Response> = None;
+        // Output items seen on `ResponseOutputItemDone`. Only collected when
+        // `backfill_output_from_items` is set; stays empty otherwise (see the
+        // backfill below).
+        let mut streamed_output_items: Vec<rs::OutputItem> = Vec::new();
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
@@ -404,6 +417,9 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                    if backfill_output_from_items {
+                        streamed_output_items.push(done_event.item.clone());
+                    }
                     match &done_event.item {
                         rs::OutputItem::WebSearchCall(ws) => {
                             let result = serde_json::to_value(ws).ok();
@@ -498,6 +514,29 @@ pub(crate) fn stream_responses_tracked<'a>(
                 return;
             }
         };
+
+        // The ChatGPT-hosted Codex endpoint delivers the assistant message only
+        // on `ResponseOutputItemDone` and sends the terminal event with
+        // `output: []`. Without this, the response converts to zero
+        // conversation items, reads as `NoVisibleContent`, and gets resampled
+        // even though the text already streamed to the user.
+        //
+        // Opt-in per endpoint, not inferred from the stream: a backend that
+        // legitimately ends a turn with no output keeps that meaning, so this
+        // can never invent content for anything but the endpoint known to need
+        // it. Within that endpoint it still only fills a gap — a terminal event
+        // carrying its own `output` wins.
+        if backfill_output_from_items
+            && response.output.is_empty()
+            && !streamed_output_items.is_empty()
+        {
+            tracing::debug!(
+                items = streamed_output_items.len(),
+                "terminal Responses event carried no output; \
+                 backfilling from ResponseOutputItemDone"
+            );
+            response.output = std::mem::take(&mut streamed_output_items);
+        }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`,
         // `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative
@@ -687,6 +726,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -708,6 +748,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -727,6 +768,154 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// `response.output_item.done` carrying a finished assistant message.
+    fn assistant_output_item_done_event(text: &str) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: 0,
+            output_index: 0,
+            item: rs::OutputItem::Message(rs_types::OutputMessage {
+                content: vec![rs_types::OutputMessageContent::OutputText(
+                    rs_types::OutputTextContent {
+                        annotations: vec![],
+                        logprobs: None,
+                        text: text.to_owned(),
+                    },
+                )],
+                id: "msg-1".into(),
+                role: rs_types::AssistantRole::Assistant,
+                status: rs_types::OutputStatus::Completed,
+            }),
+        })
+    }
+
+    fn assistant_text(response: &xai_grok_sampling_types::ConversationResponse) -> String {
+        response
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Assistant(a) => Some(a.content.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The ChatGPT-hosted Codex backend streams the assistant message on
+    /// `response.output_item.done` and then sends `response.completed` with
+    /// `output: []`. Without the backfill the turn converts to no visible
+    /// content and gets resampled, despite the text having already streamed.
+    #[tokio::test]
+    async fn output_item_done_backfills_an_empty_terminal_output() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("OK")),
+            Ok(assistant_output_item_done_event("OK")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            true,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(
+                    response.empty_reason(),
+                    None,
+                    "backfilled output must not read as an empty response"
+                );
+                assert_eq!(assistant_text(response), "OK");
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The gate is what keeps every non-Codex backend on its previous
+    /// behaviour: the same stream with the flag off must still assemble to an
+    /// empty response, exactly as it did before the backfill existed.
+    #[tokio::test]
+    async fn backfill_is_off_by_default_for_other_backends() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("OK")),
+            Ok(assistant_output_item_done_event("OK")),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            false,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(
+                    response.empty_reason(),
+                    Some(xai_grok_sampling_types::error::EmptyReason::NoVisibleContent),
+                    "an ungated backend must keep the terminal event as the sole \
+                     source of output"
+                );
+                assert_eq!(assistant_text(response), "");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Even with the backfill enabled, a terminal event that carries its own
+    /// output owns the result — the streamed duplicate must not replace it.
+    #[tokio::test]
+    async fn populated_terminal_output_is_left_untouched() {
+        let mut completed = empty_completed_response();
+        completed.output = vec![rs::OutputItem::Message(rs_types::OutputMessage {
+            content: vec![rs_types::OutputMessageContent::OutputText(
+                rs_types::OutputTextContent {
+                    annotations: vec![],
+                    logprobs: None,
+                    text: "from terminal event".into(),
+                },
+            )],
+            id: "msg-1".into(),
+            role: rs_types::AssistantRole::Assistant,
+            status: rs_types::OutputStatus::Completed,
+        })];
+        let completed =
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response: completed,
+                sequence_number: 0,
+            });
+
+        let raw = stream::iter(vec![
+            Ok(assistant_output_item_done_event("from output_item.done")),
+            Ok(completed),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            true,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(assistant_text(response), "from terminal event");
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -754,6 +943,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -780,6 +970,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -806,6 +997,7 @@ mod tests {
             rid(),
             Duration::from_millis(100),
             None,
+            false,
         ))
         .await;
 
@@ -830,6 +1022,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -904,6 +1097,7 @@ mod tests {
             Duration::from_secs(60),
             None,
             Arc::clone(&output_observed),
+            false,
         ))
         .await;
 
@@ -945,6 +1139,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
 
@@ -1038,6 +1233,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
         let deltas = tool_call_deltas(&evs);
@@ -1069,6 +1265,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
         assert_eq!(tool_call_deltas(&evs).len(), 0);
@@ -1090,6 +1287,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
         let deltas = tool_call_deltas(&evs);
@@ -1119,6 +1317,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             Some(collector),
+            false,
         ))
         .await;
 
@@ -1150,6 +1349,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             Some(collector),
+            false,
         ))
         .await;
         match events.last().unwrap() {
@@ -1182,6 +1382,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             Some(collector),
+            false,
         ))
         .await;
         match events.last().unwrap() {
@@ -1201,6 +1402,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             None,
+            false,
         ))
         .await;
         match events.last().unwrap() {
@@ -1218,6 +1420,7 @@ mod tests {
             rid(),
             Duration::from_secs(60),
             Some(crate::doom_loop::DoomLoopSignalCollector::default()),
+            false,
         ))
         .await;
         match events.last().unwrap() {
