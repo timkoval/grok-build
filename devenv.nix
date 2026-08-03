@@ -8,9 +8,13 @@
   # https://devenv.sh/languages/
   languages.rust = {
     enable = true;
-    channel = "stable";
-    # rust-toolchain.toml pins 1.92.0 — devenv uses rustup which respects it
-    components = [ "rustfmt" "clippy" ];
+    # Single source of truth: rust-toolchain.toml (channel 1.92.0, components,
+    # targets, profile) is read via rust-overlay's fromRustupToolchainFile.
+    # Do NOT set channel/version/components/targets here — devenv asserts they
+    # are mutually exclusive with toolchainFile, and an explicit `components`
+    # list *replaces* the defaults (dropping rustc/cargo, which breaks the
+    # toolchain symlinkJoin on darwin).
+    toolchainFile = ./rust-toolchain.toml;
   };
 
   # Build dependencies per README:
