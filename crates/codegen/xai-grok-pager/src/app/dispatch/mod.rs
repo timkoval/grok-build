@@ -37,8 +37,13 @@ mod transcript;
 mod turn;
 mod voice;
 
+pub(crate) use auth::scrollback_has_recent_disk_full;
+pub(in crate::app) use auth::scrollback_has_recent_error_banner;
 pub(crate) use billing::{UPSELL_URL_PAYG, UPSELL_URL_UPGRADE, is_credit_limit_error};
+// set_yolo_mode_inner: re-exported for UI config hot-reload (fork)
 pub(crate) use modes::{downgrade_displayed_auto_if_gated, effective_auto, set_yolo_mode_inner};
+#[cfg(test)]
+pub(crate) use notes::FEEDBACK_QUESTION_LABEL;
 pub(crate) use notes::{recap_unavailable_toast, scrollback_has_user_messages};
 pub(crate) use permissions::resolve_permission_queue_transition;
 pub(crate) use prompt::dispatch_initial_prompt;
@@ -52,7 +57,7 @@ pub(crate) use router::dispatch;
 pub(crate) use settings::ui::refresh_open_settings_modals;
 pub(crate) use settings::setters::{set_fork_secondary_model_inner, set_theme_inner};
 pub(crate) use status::commit_minimal_update_notice;
-pub(crate) use turn::reconcile_overdue_turn_ends;
+pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};
 
 // Test-only consumers (cfg(test) mods elsewhere in the crate); a plain
 // re-export trips -D unused-imports in the lib build.
@@ -61,7 +66,7 @@ pub(crate) use ctx::{SwitchCause, switch_to_agent};
 #[cfg(test)]
 pub(crate) use settings::ui::{ROLLBACK_NO_ARM_TOAST, build_pager_snapshot};
 #[cfg(test)]
-pub(crate) use turn::TURN_END_RECONCILE_GRACE;
+pub(crate) use turn::{CANCEL_RESEND_GRACE, TURN_END_RECONCILE_GRACE};
 
 #[cfg(test)]
 mod tests;
