@@ -51,6 +51,14 @@ fn is_codex_chatgpt_backend(base_url: &str) -> bool {
     base_url.contains(CODEX_BACKEND_PATH_MARKER)
 }
 
+/// True for OpenAI-hosted Responses endpoints and the ChatGPT-hosted Codex
+/// endpoint. Keep protocol quirks scoped here so xAI Responses streams retain
+/// strict event handling.
+fn is_openai_responses_backend(base_url: &str) -> bool {
+    let url = base_url.to_ascii_lowercase();
+    url.contains("openai.com") || url.contains("chatgpt.com")
+}
+
 /// Rewrite `system` input roles to `developer` in place.
 ///
 /// The ChatGPT-hosted Codex backend refuses a `system` role outright, but
@@ -142,6 +150,19 @@ impl GrokRequestHeaders<'_> {
 /// `ResponseUsage` unchanged so billing telemetry stays correct. When
 /// the API doesn't emit `context_details` (older deployments) `total_tokens`
 /// passes through unchanged.
+fn is_keepalive_event(event_name: &str, data: &str) -> bool {
+    event_name == "keepalive"
+        || serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|event_type| event_type == "keepalive")
+            })
+            .unwrap_or(false)
+}
+
 fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
@@ -1571,6 +1592,7 @@ impl SamplingClient {
         }
 
         let model_metadata = extract_model_metadata(response.headers());
+        let accept_keepalive = is_openai_responses_backend(&self.base_url);
 
         // Strip UTF-8 BOM if present
         const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
@@ -1605,6 +1627,10 @@ impl SamplingClient {
                         let data = &event.data;
                         if data == "[DONE]" {
                             return std::future::ready(None);
+                        }
+
+                        if accept_keepalive && is_keepalive_event(&event.event, data) {
+                            return std::future::ready(Some(None));
                         }
 
                         tracing::info!(
@@ -2999,6 +3025,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keepalive_compatibility_is_scoped_to_openai_hosts() {
+        assert!(is_openai_responses_backend("https://api.openai.com/v1"));
+        assert!(is_openai_responses_backend(
+            "https://chatgpt.com/backend-api/codex"
+        ));
+        assert!(!is_openai_responses_backend("https://api.x.ai/v1"));
+        assert!(!is_openai_responses_backend(
+            "https://example.com/openai-compatible/v1"
+        ));
+    }
+
+    #[test]
+    fn keepalive_events_are_recognized_before_response_deserialization() {
+        assert!(is_keepalive_event("keepalive", "{}"));
+        assert!(is_keepalive_event("message", r#"{"type":"keepalive"}"#));
+        assert!(!is_keepalive_event(
+            "message",
+            r#"{"type":"response.created"}"#
+        ));
+    }
+
     /// `response.completed` carrying
     /// `usage.context_details.{input_tokens, output_tokens}` rewrites
     /// `usage.total_tokens` in place to the live context length
@@ -3044,6 +3092,8 @@ mod tests {
         assert_eq!(usage.total_tokens, 5_593);
     }
 
+    /// `response.completed` carrying
+    /// `usage.context_details.{input_tokens, output_tokens}` rewrites
     #[test]
     fn deserialize_response_event_stashes_cost_in_metadata() {
         let make = |ticks: i64| {
