@@ -1,21 +1,17 @@
-//! Whether a personally disabled MCP name should appear as a re-enableable
-//! stub in `/mcps`.
+//! Whether a personally disabled MCP name should appear as a re-enableable stub in `/mcps`.
 //!
-//! Aligns list stubs with Space enable: show a row only when a definition still
-//! exists (ignoring personal disable) and org policy would not block enable.
+//! A row shows only when a definition still exists (ignoring personal disable) and org policy would not block enable.
 //! Orphans that only linger in `disabled_mcp_servers` stay hidden.
 //!
-//! Discovery is shared with session merge
-//! ([`crate::session::managed_mcp::discover_mcp_definitions_ignoring_disable`]).
+//! Discovery is shared with session merge ([`crate::session::managed_mcp::discover_mcp_definitions_ignoring_disable`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use agent_client_protocol as acp;
-use xai_grok_workspace::permission::resolution::McpServerAllowlist;
+use xai_grok_workspace::permission::resolution::{ManagedSettings, McpSubject, McpVerdict};
 
 use crate::session::managed_mcp::{McpDiscoveryInputs, discover_mcp_definitions_ignoring_disable};
 
-/// Outcome of asking whether a disabled MCP should appear as a list stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisabledStubVerdict {
     /// Show a disabled row the user can Space-enable.
@@ -28,11 +24,9 @@ pub(crate) enum DisabledStubVerdict {
     HidePolicyBlocked,
 }
 
-/// Single-pass index of MCP names that still have a definition when personal
-/// disable is ignored.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct McpDefinitionIndex {
-    entries: HashMap<String, acp::McpServer>,
+    entries: HashMap<String, (acp::McpServer, McpSubject)>,
 }
 
 impl McpDefinitionIndex {
@@ -46,15 +40,15 @@ impl McpDefinitionIndex {
         &self,
         name: &str,
         in_catalog: bool,
-        allowlist: &McpServerAllowlist,
+        ms: &ManagedSettings,
     ) -> DisabledStubVerdict {
         if in_catalog {
             return DisabledStubVerdict::HideAlreadyInCatalog;
         }
-        let Some(server) = self.entries.get(name) else {
+        let Some((server, subject)) = self.entries.get(name) else {
             return DisabledStubVerdict::HideNoDefinition;
         };
-        if !allowlist.is_server_allowed(server) {
+        if let McpVerdict::Blocked(_) = ms.mcp_verdict(server, *subject) {
             return DisabledStubVerdict::HidePolicyBlocked;
         }
         DisabledStubVerdict::Show
@@ -65,11 +59,11 @@ impl McpDefinitionIndex {
         &self,
         disabled_names: &HashSet<String>,
         catalog_names: &HashSet<String>,
-        allowlist: &McpServerAllowlist,
+        ms: &ManagedSettings,
     ) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for name in disabled_names {
-            let verdict = self.verdict(name, catalog_names.contains(name), allowlist);
+            let verdict = self.verdict(name, catalog_names.contains(name), ms);
             if matches!(verdict, DisabledStubVerdict::Show) {
                 out.insert(name.clone());
             } else {
@@ -83,9 +77,35 @@ impl McpDefinitionIndex {
         out
     }
 
+    /// The discovered definitions with their policy subjects — the one discovery pass shared between
+    /// stub filtering and the list's blocked-reason verdicts.
+    pub(crate) fn definitions(&self) -> impl Iterator<Item = (&str, &acp::McpServer, McpSubject)> {
+        self.entries
+            .iter()
+            .map(|(name, (server, subject))| (name.as_str(), server, *subject))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_entries(entries: HashMap<String, acp::McpServer>) -> Self {
-        Self { entries }
+        use xai_grok_workspace::permission::resolution::PolicySubjectOrigin;
+        // Test entries default to foreign: every policy source binds.
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(name, server)| {
+                    (
+                        name,
+                        (
+                            server,
+                            McpSubject {
+                                origin: PolicySubjectOrigin::Foreign,
+                                project_scoped: false,
+                            },
+                        ),
+                    )
+                })
+                .collect(),
+        }
     }
 
     #[cfg(test)]
@@ -95,12 +115,10 @@ impl McpDefinitionIndex {
 
     #[cfg(test)]
     pub(crate) fn transport(&self, name: &str) -> Option<&acp::McpServer> {
-        self.entries.get(name)
+        self.entries.get(name).map(|(server, _)| server)
     }
 }
 
-/// True when at least one disabled name is missing from the live catalog and
-/// needs a definition scan.
 pub(crate) fn needs_definition_scan(
     disabled_names: &HashSet<String>,
     catalog_names: &HashSet<String>,
@@ -108,53 +126,46 @@ pub(crate) fn needs_definition_scan(
     disabled_names.iter().any(|n| !catalog_names.contains(n))
 }
 
-/// Sorted disabled names that should get a list stub.
-pub(crate) fn reenableable_disabled_stubs(
-    disabled_names: &HashSet<String>,
-    catalog_names: &HashSet<String>,
-    inputs: &McpDiscoveryInputs<'_>,
-) -> BTreeSet<String> {
-    if !needs_definition_scan(disabled_names, catalog_names) {
-        return BTreeSet::new();
-    }
-    let index = McpDefinitionIndex::build(inputs);
-    let settings = xai_grok_workspace::permission::resolution::managed_settings();
-    index.reenableable_for_list(disabled_names, catalog_names, &settings.mcp_allowlist)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::managed_mcp::{ManagedMcpConfig, mcp_server_name};
+    use crate::session::managed_mcp::mcp_server_name;
     use xai_grok_tools::types::compat::CompatConfig;
-    use xai_grok_workspace::permission::resolution::AllowedMcpServer;
+    use xai_grok_workspace::permission::resolution::{
+        AllowedMcpServer, McpServerAllowlist, McpServerPolicy,
+    };
 
-    fn unrestricted() -> McpServerAllowlist {
-        McpServerAllowlist::new(vec![], vec![], None)
+    fn settings_with_policy(policy: McpServerPolicy) -> ManagedSettings {
+        let mut ms = ManagedSettings::default();
+        ms.mcp_allowlist = policy;
+        ms
     }
 
-    fn deny_name(name: &str) -> McpServerAllowlist {
-        McpServerAllowlist::new(
+    fn unrestricted() -> ManagedSettings {
+        settings_with_policy(McpServerPolicy::single(McpServerAllowlist::new(
+            vec![],
+            vec![],
+            None,
+        )))
+    }
+
+    fn deny_name(name: &str) -> ManagedSettings {
+        settings_with_policy(McpServerPolicy::single(McpServerAllowlist::new(
             vec![],
             vec![AllowedMcpServer::Name {
                 name: name.to_string(),
             }],
             None,
-        )
+        )))
     }
 
     fn http(name: &str, url: &str) -> acp::McpServer {
         acp::McpServer::Http(acp::McpServerHttp::new(name, url.to_string()).headers(vec![]))
     }
 
-    fn inputs<'a>(
-        cwd: &'a std::path::Path,
-        managed: &'a [ManagedMcpConfig],
-        compat: &'a CompatConfig,
-    ) -> McpDiscoveryInputs<'a> {
+    fn inputs<'a>(cwd: &'a std::path::Path, compat: &'a CompatConfig) -> McpDiscoveryInputs<'a> {
         McpDiscoveryInputs {
             cwd,
-            managed_configs: managed,
             plugin_registry: None,
             compat,
         }
@@ -198,7 +209,7 @@ mod tests {
         ]));
         let unrestricted = unrestricted();
         let deny_blocked = deny_name("blocked");
-        let cases: &[(&str, bool, &McpServerAllowlist, DisabledStubVerdict)] = &[
+        let cases: &[(&str, bool, &ManagedSettings, DisabledStubVerdict)] = &[
             (
                 "local",
                 true,
@@ -246,49 +257,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_indexes_live_managed_catalog() {
+    fn orphan_grok_com_name_is_not_a_definition() {
         let (_home, _hg, _gg) = isolated_home();
-        let managed = [ManagedMcpConfig {
-            name: "Slack".into(),
-            endpoint: "https://example.com/mcp".into(),
-            headers: HashMap::from([("Authorization".into(), "Bearer x".into())]),
-            token_expires_at: None,
-            scope: None,
-            scope_id: None,
-            scope_name: None,
-        }];
-        let slack = crate::session::managed_mcp::to_managed_name("Slack");
         let cwd = tempfile::tempdir().unwrap();
         let compat = CompatConfig::default();
-        let index = McpDefinitionIndex::build(&inputs(cwd.path(), &managed, &compat));
-        assert!(index.contains(&slack));
-        let disabled = HashSet::from([slack.clone(), "totally_orphan_xyz".into()]);
+        let index = McpDefinitionIndex::build(&inputs(cwd.path(), &compat));
+        assert!(!index.contains("grok_com_slack"));
+        let disabled = HashSet::from(["grok_com_slack".into(), "totally_orphan_xyz".into()]);
         let stubs = index.reenableable_for_list(&disabled, &HashSet::new(), &unrestricted());
-        assert!(stubs.contains(&slack));
+        assert!(!stubs.contains("grok_com_slack"));
         assert!(!stubs.contains("totally_orphan_xyz"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_skips_managed_with_empty_headers() {
-        let (_home, _hg, _gg) = isolated_home();
-        let managed = [ManagedMcpConfig {
-            name: "NoHeaders".into(),
-            endpoint: "https://example.com/mcp".into(),
-            headers: HashMap::new(),
-            token_expires_at: None,
-            scope: None,
-            scope_id: None,
-            scope_name: None,
-        }];
-        let name = crate::session::managed_mcp::to_managed_name("NoHeaders");
-        let cwd = tempfile::tempdir().unwrap();
-        let compat = CompatConfig::default();
-        let index = McpDefinitionIndex::build(&inputs(cwd.path(), &managed, &compat));
-        assert!(
-            !index.contains(&name),
-            "empty-header managed configs must not appear (same as auto_inject)"
-        );
     }
 
     #[test]
@@ -303,7 +281,7 @@ enabled = false
 "#,
         );
         let compat = CompatConfig::default();
-        let index = McpDefinitionIndex::build(&inputs(repo.path(), &[], &compat));
+        let index = McpDefinitionIndex::build(&inputs(repo.path(), &compat));
         assert!(
             index.contains("reenable_disabled_local"),
             "enabled=false TOML definition must still be discoverable"
@@ -330,24 +308,13 @@ command = "echo"
 args = ["ok"]
 "#,
         );
-        let managed = [ManagedMcpConfig {
-            name: "DriftSlack".into(),
-            endpoint: "https://example.com/mcp".into(),
-            headers: HashMap::from([("Authorization".into(), "Bearer x".into())]),
-            token_expires_at: None,
-            scope: None,
-            scope_id: None,
-            scope_name: None,
-        }];
         let mut compat = CompatConfig::default();
         compat.claude.mcps = false;
         compat.cursor.mcps = false;
-        let discovered =
-            discover_mcp_definitions_ignoring_disable(&inputs(repo.path(), &managed, &compat));
+        let discovered = discover_mcp_definitions_ignoring_disable(&inputs(repo.path(), &compat));
         let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
             vec![],
             repo.path(),
-            &managed,
             None,
             &compat,
         );
@@ -360,66 +327,13 @@ args = ["ok"]
             merged_names.is_subset(&discovered_names),
             "merge survivors must be reenable-discoverable: merge={merged_names:?} discovered={discovered_names:?}"
         );
-        let slack = crate::session::managed_mcp::to_managed_name("DriftSlack");
         assert!(discovered_names.contains("drift_check_server"));
-        assert!(discovered_names.contains(&slack));
         assert!(merged_names.contains("drift_check_server"));
-        assert!(merged_names.contains(&slack));
     }
 
     #[test]
     #[serial_test::serial]
-    fn managed_inject_keeps_name_when_same_url_local_exists() {
-        let (_home, _hg, _gg) = isolated_home();
-        let repo = project_repo(
-            r#"
-[mcp_servers.proxy]
-url = "https://shared.example.com/mcp"
-"#,
-        );
-        let managed = [ManagedMcpConfig {
-            name: "Slack".into(),
-            endpoint: "https://shared.example.com/mcp".into(),
-            headers: HashMap::from([("Authorization".into(), "Bearer x".into())]),
-            token_expires_at: None,
-            scope: None,
-            scope_id: None,
-            scope_name: None,
-        }];
-        let slack = crate::session::managed_mcp::to_managed_name("Slack");
-        let mut compat = CompatConfig::default();
-        compat.claude.mcps = false;
-        compat.cursor.mcps = false;
-        let disc_inputs = inputs(repo.path(), &managed, &compat);
-        let discovered = discover_mcp_definitions_ignoring_disable(&disc_inputs);
-        let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
-            vec![],
-            repo.path(),
-            &managed,
-            None,
-            &compat,
-        );
-        let merged_names: HashSet<_> = merged
-            .iter()
-            .map(|s| mcp_server_name(s).to_string())
-            .collect();
-        assert!(discovered.contains_key("proxy"));
-        assert!(
-            discovered.contains_key(&slack),
-            "managed name must survive same-URL local (name-based inject)"
-        );
-        assert!(merged_names.contains(&slack));
-        assert!(merged_names.contains("proxy"));
-
-        let disabled = HashSet::from([slack.clone()]);
-        let index = McpDefinitionIndex::build(&disc_inputs);
-        let stubs = index.reenableable_for_list(&disabled, &HashSet::new(), &unrestricted());
-        assert!(stubs.contains(&slack));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn toml_duplicate_url_last_wins_matches_merge() {
+    fn toml_duplicate_url_both_kept_matches_merge() {
         let (_home, _hg, _gg) = isolated_home();
         let repo = project_repo(
             r#"
@@ -433,12 +347,10 @@ url = "https://dup.example.com/mcp"
         let mut compat = CompatConfig::default();
         compat.claude.mcps = false;
         compat.cursor.mcps = false;
-        let discovered =
-            discover_mcp_definitions_ignoring_disable(&inputs(repo.path(), &[], &compat));
+        let discovered = discover_mcp_definitions_ignoring_disable(&inputs(repo.path(), &compat));
         let merged = crate::session::managed_mcp::merge_managed_mcp_servers(
             vec![],
             repo.path(),
-            &[],
             None,
             &compat,
         );
@@ -446,10 +358,10 @@ url = "https://dup.example.com/mcp"
             .iter()
             .map(|s| mcp_server_name(s).to_string())
             .collect();
-        // Last TOML entry wins the URL key on both paths.
+        // Name is the identity: a shared URL never collapses entries
+        assert!(discovered.contains_key("first"));
         assert!(discovered.contains_key("second"));
-        assert!(!discovered.contains_key("first"));
+        assert!(merged_names.contains("first"));
         assert!(merged_names.contains("second"));
-        assert!(!merged_names.contains("first"));
     }
 }

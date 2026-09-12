@@ -1,6 +1,4 @@
-//! Replay of records earlier builds wrote, asserted on what reaches the client.
-
-use std::collections::HashMap;
+//! Replays records earlier builds wrote and asserts on what reaches the client.
 
 use agent_client_protocol as acp;
 use serde_json::Value;
@@ -9,9 +7,8 @@ use super::MvpAgent;
 use crate::tools::task_completed_frame::FRAME_MAX_BYTES;
 use xai_acp_lib::{AcpAgentGatewaySender as GatewaySender, AcpClientMessage};
 
-/// The record is built from the real notification type, so renaming a field
-/// the refit looks up by name fails this test rather than silently putting
-/// oversized lines back on the wire.
+/// The record is built from the real notification type.
+/// Renaming a field the refit looks up by name then fails this test rather than silently putting oversized lines back on the wire.
 #[tokio::test]
 async fn replay_shrinks_an_oversized_completion() {
     let (agent, mut rx) = build_agent_with_gateway();
@@ -21,9 +18,8 @@ async fn replay_shrinks_an_oversized_completion() {
         &line,
         /*persist_data*/ None,
         /*target_client_id*/ None,
-        &mut Vec::new(),
         /*mark_replay*/ false,
-        &mut HashMap::new(),
+        &mut crate::session::storage::ReplayToolCollapser::new(),
     );
 
     let params = next_ext_notification_params(&mut rx).expect("the record must still be sent");
@@ -64,6 +60,7 @@ fn recorded_completion(output: String) -> Value {
                 completed: true,
                 block_waited: false,
                 explicitly_killed: false,
+                kill_result_delivered: false,
                 kind: Default::default(),
                 owner_session_id: None,
                 description: None,
@@ -83,8 +80,7 @@ fn replay_line(record: &Value) -> String {
     serde_json::json!({ "method": "_x.ai/session/update", "params": record }).to_string()
 }
 
-/// The branch a plain resume takes: `_meta` is added to the record, so the fit
-/// has to happen after that and not before.
+/// The branch a plain resume takes: `_meta` is added to the record, so the fit has to happen after that and not before.
 #[tokio::test]
 async fn a_marked_replay_is_fitted_after_its_metadata_is_added() {
     let (agent, mut rx) = build_agent_with_gateway();
@@ -95,9 +91,8 @@ async fn a_marked_replay_is_fitted_after_its_metadata_is_added() {
         &line,
         Some(&persist),
         /*target_client_id*/ None,
-        &mut Vec::new(),
         /*mark_replay*/ true,
-        &mut HashMap::new(),
+        &mut crate::session::storage::ReplayToolCollapser::new(),
     );
 
     let params = next_ext_notification_params(&mut rx).expect("the record must still be sent");
@@ -109,8 +104,7 @@ async fn a_marked_replay_is_fitted_after_its_metadata_is_added() {
     assert!(params.contains("isReplay"));
 }
 
-/// A completion nothing can shrink is dropped, because sending it is what
-/// closes the connection.
+/// A completion nothing can shrink is dropped, because sending it is what closes the connection.
 #[tokio::test]
 async fn replay_drops_a_completion_nothing_can_shrink() {
     let (agent, mut rx) = build_agent_with_gateway();
@@ -122,9 +116,8 @@ async fn replay_drops_a_completion_nothing_can_shrink() {
         &line,
         /*persist_data*/ None,
         /*target_client_id*/ None,
-        &mut Vec::new(),
         /*mark_replay*/ false,
-        &mut HashMap::new(),
+        &mut crate::session::storage::ReplayToolCollapser::new(),
     );
 
     assert!(next_ext_notification_params(&mut rx).is_none());
@@ -140,9 +133,8 @@ async fn replay_forwards_records_within_the_limit_untouched() {
         &line,
         /*persist_data*/ None,
         /*target_client_id*/ None,
-        &mut Vec::new(),
         /*mark_replay*/ false,
-        &mut HashMap::new(),
+        &mut crate::session::storage::ReplayToolCollapser::new(),
     );
 
     let params = next_ext_notification_params(&mut rx).expect("forwarded");
@@ -162,17 +154,30 @@ async fn replay_leaves_other_oversized_records_alone() {
         &line,
         /*persist_data*/ None,
         /*target_client_id*/ None,
-        &mut Vec::new(),
         /*mark_replay*/ false,
-        &mut HashMap::new(),
+        &mut crate::session::storage::ReplayToolCollapser::new(),
     );
 
     let params = next_ext_notification_params(&mut rx).expect("forwarded");
     assert_eq!(params, recorded);
 }
 
-/// Stale-task reconciliation on a cold load builds its completion from a
-/// recorded command of any size, so its line is measured like the rest.
+#[tokio::test]
+async fn parent_replay_does_not_emit_meta_less_unfinished_tool_call() {
+    let (agent, mut rx) = build_agent_with_gateway();
+    let mut collapser = crate::session::storage::ReplayToolCollapser::new();
+    let tool = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"bash","status":"pending"},"_meta":{"eventId":"s-1"}}}"#;
+    let start = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"ls"},"_meta":{"eventId":"s-2"}}}"#;
+    agent.forward_raw_replay_line(tool, None, None, false, &mut collapser);
+    agent.forward_raw_replay_line(start, None, None, false, &mut collapser);
+    assert_eq!(collapser.pending_len(), 1);
+    assert!(
+        rx.try_recv().is_err(),
+        "parent must not synthesize a meta-less ToolCall at EOF"
+    );
+}
+
+/// Stale-task reconciliation on a cold load builds its completion from a recorded command of any size, so its line is measured like the rest.
 #[tokio::test]
 async fn a_stale_task_completion_is_frame_bounded() {
     let (agent, mut rx) = build_agent_with_gateway();
@@ -195,12 +200,56 @@ async fn a_stale_task_completion_is_frame_bounded() {
     assert!(params.contains("session_restart"));
 }
 
+#[tokio::test]
+async fn stale_task_reconcile_keeps_incrementals_without_list() {
+    let (agent, mut rx) = build_agent_with_gateway();
+    let dir = tempfile::tempdir().unwrap();
+    let line = r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","task_id":"stale-1","command":"sleep 1","cwd":"/tmp"}}}"#;
+    let path = dir.path().join("updates.jsonl");
+    std::fs::write(&path, line).unwrap();
+
+    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+
+    let notifs = drain_ext_notifications(&mut rx);
+    assert!(
+        notifs.iter().any(|(method, params)| {
+            method == "x.ai/task_completed" && params.contains("session_restart")
+        }),
+        "incremental completion must stay: {notifs:?}"
+    );
+    assert!(
+        !notifs.iter().any(|(method, params)| {
+            method == "x.ai/session_notification"
+                && params.contains("\"sessionUpdate\":\"background_tasks\"")
+        }),
+        "reconcile is not the last-wins list writer: {notifs:?}"
+    );
+}
+
+#[tokio::test]
+async fn cold_load_with_no_orphans_emits_no_reconcile_notifications() {
+    let (agent, mut rx) = build_agent_with_gateway();
+    let dir = tempfile::tempdir().unwrap();
+    let line = r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","task_id":"done-1","command":"sleep 1","cwd":"/tmp"}}}
+{"timestamp":2,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"done-1"}}}}"#;
+    let path = dir.path().join("updates.jsonl");
+    std::fs::write(&path, line).unwrap();
+
+    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+
+    let notifs = drain_ext_notifications(&mut rx);
+    assert!(
+        notifs.is_empty(),
+        "paired tasks must not emit reconcile traffic: {notifs:?}"
+    );
+}
+
 fn build_agent_with_gateway() -> (
     MvpAgent,
     tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
 ) {
     use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
+    use xai_grok_login::{AuthManager, GrokComConfig};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let auth_manager =
@@ -211,6 +260,7 @@ fn build_agent_with_gateway() -> (
         &AgentConfig::default(),
         auth_manager,
         None,
+        None,
     )
     .expect("valid test config");
     (agent, rx)
@@ -219,12 +269,24 @@ fn build_agent_with_gateway() -> (
 fn next_ext_notification_params(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
 ) -> Option<String> {
-    let mut params = None;
+    drain_ext_notifications(rx)
+        .into_iter()
+        .next()
+        .map(|(_, params)| params)
+}
+
+fn drain_ext_notifications(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AcpClientMessage>,
+) -> Vec<(String, String)> {
+    let mut notifs = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let AcpClientMessage::ExtNotification(args) = msg {
-            params.get_or_insert_with(|| args.request.params.get().to_string());
+            notifs.push((
+                args.request.method.as_ref().to_string(),
+                args.request.params.get().to_string(),
+            ));
             let _ = args.response_tx.send(Ok(()));
         }
     }
-    params
+    notifs
 }

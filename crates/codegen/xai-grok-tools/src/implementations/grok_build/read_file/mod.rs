@@ -18,6 +18,7 @@ use crate::types::resources::{
     Cwd, DisplayCwd, FileSystem, GitignoreFilter, PathNotFoundHints, RespectGitignore,
     SharedResources, TruncationCfg, display_cwd_or_cwd, resolve_model_path,
 };
+use crate::types::skill_discovery_tracker::SkillManager;
 use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::{ToolKind, ToolNamespace};
 use std::sync::LazyLock;
@@ -31,10 +32,8 @@ pub struct ReadFileParams {
     pub cursor_rules_on_read: bool,
 }
 crate::register_resource!("grok_build", "ReadFile", ReadFileParams);
-/// Internal version discriminant for read_file.
-///
-/// `read_file` has cross-cutting version divergence: gitignore enforcement
-/// and error mapping. If extracting into version modules, this tool is the
+/// Internal version discriminant for read_file. `read_file` has cross-cutting version divergence:
+/// gitignore enforcement and error mapping. If extracting into version modules, this tool is the
 /// highest-risk candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadFileVersion {
@@ -90,10 +89,8 @@ async fn handle_pptx(
     )
     .await
 }
-/// Extract text from a PPTX file (zip + DrawingML text runs).
-///
-/// Returns line-numbered text via the shared `raw_text_to_file_content`
-/// helper.
+/// Extract text from a PPTX file (zip + DrawingML text runs). Returns line-numbered text via the
+/// shared `raw_text_to_file_content` helper.
 fn extract_pptx_text(file_bytes: Vec<u8>) -> Result<ReadFileOutput, String> {
     let text = crate::implementations::read_file::pptx::extract_pptx_text_from_bytes(&file_bytes)
         .map_err(|e| format!("Failed to extract text from PPTX: {e}"))?;
@@ -152,12 +149,9 @@ async fn cursor_rules_on_read_enabled(resources: &SharedResources) -> bool {
     res.get::<Params<ReadFileParams>>()
         .is_some_and(|p| p.0.cursor_rules_on_read)
 }
-/// Harness-compatible negative offset resolution (1-indexed start line).
-///
-/// Negatives use the reference `split('\n')` field count plus a phantom field when
-/// the file is non-empty and has no trailing `\n`. Extraction still uses
-/// `split_inclusive`, so a start that lands on the phantom-only field yields
-/// an empty window (harness-aligned; not a Grok-line clamp).
+/// Harness-compatible negative offset resolution (1-indexed start line). Negatives use the reference `split('\n')` field count plus a phantom
+/// field when the file is non-empty and has no trailing `\n`. Extraction still uses `split_inclusive`, so a start that lands on the
+/// phantom-only field yields an empty window (harness-aligned; not a Grok-line clamp).
 fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
     let offset_raw = offset.unwrap_or(1);
     if offset_raw == 0 {
@@ -179,13 +173,9 @@ fn resolve_read_start_line(file_content: &str, offset: Option<i64>) -> usize {
 fn stored_read_offset(offset: Option<i64>) -> Option<usize> {
     offset.filter(|&o| o >= 0).map(|o| o as usize)
 }
-/// Files read in full (no line/token cap): any file named exactly `SKILL.md`,
-/// plus any Markdown file with a `skills` path component so docs a `SKILL.md`
-/// references are never silently truncated. `.`/`..` are folded lexically
-/// (symlinks are not resolved). Intentionally broader than
-/// skill discovery's dir check — matches any `skills` segment
-/// (plugin/bundled/user roots), and matches it exactly (not case-folded) so
-/// near-misses like `skills-cursor` do not qualify.
+/// Files read in full (no line/token cap): any file named exactly `SKILL.md`, plus any Markdown file with a `skills` path component so docs a
+/// `SKILL.md` references are never silently truncated. Intentionally broader than skill discovery's dir check — matches any `skills` segment
+/// (plugin/bundled/user roots), and matches it exactly (not case-folded) so near-misses like `skills-cursor` do not qualify.
 fn is_skill_markdown(path: &std::path::Path) -> bool {
     if path.file_name().is_some_and(|n| n == "SKILL.md") {
         return true;
@@ -324,11 +314,9 @@ pub fn extract_file_content_lines(
         extracted_images,
     }
 }
-/// Core read-file logic shared by `ReadFileTool` and `ReadFileConciseTool`.
-///
-/// Always uses the padded `content` field. Concise post-processing
-/// (swapping in `content_concise`) is done by `ReadFileConciseTool` after this
-/// returns.
+/// Core read-file logic shared by `ReadFileTool` and `ReadFileConciseTool`. Always uses the padded
+/// `content` field. Concise post-processing (swapping in `content_concise`) is done by
+/// `ReadFileConciseTool` after this returns.
 pub(crate) async fn run_read_file(
     input: ReadFileInput,
     cwd_override: Option<std::path::PathBuf>,
@@ -350,6 +338,7 @@ pub(crate) async fn run_read_file(
     }
     let joined_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.path);
     let is_skill_markdown = is_skill_markdown(&joined_path);
+    let policy_path = joined_path.clone();
     let (path, _unicode_note) = match crate::util::fs::try_canonicalize(&joined_path).await {
         Ok(p) => (p, None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -360,6 +349,11 @@ pub(crate) async fn run_read_file(
         }
         Err(_) => (joined_path, None),
     };
+    if let Err(error) =
+        crate::types::memory_v2::validate_memory_v2_read(&resources, &policy_path).await
+    {
+        return Ok(ReadFileOutput::FileReadError(error));
+    }
     let version = ReadFileVersion::from_contract(contract_version);
     let is_legacy = version.is_legacy();
     let skip_gitignore = is_legacy && versions::legacy_0_4_10::allows_gitignored_reads();
@@ -377,7 +371,7 @@ pub(crate) async fn run_read_file(
             )));
         }
     }
-    let file_bytes = match fs.read_file(&path).await {
+    let mut file_bytes = match fs.read_file(&path).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::debug!(?e, "Failed to read file");
@@ -390,14 +384,30 @@ pub(crate) async fn run_read_file(
             let display_path = display_dcwd.join(&input.path);
             return Ok(match e.io_error_kind() {
                 Some(std::io::ErrorKind::NotFound) => {
-                    let msg = crate::util::format_not_found_error(
+                    let skill_suggestion = {
+                        let res = resources.lock().await;
+                        res.get::<SkillManager>()
+                            .and_then(|manager| manager.suggest_skill_path(&path))
+                    };
+                    let verified_skill_suggestion = if let Some(suggestion) = skill_suggestion
+                        && fs.file_exists(&suggestion.path).await.unwrap_or(false)
+                    {
+                        Some(suggestion)
+                    } else {
+                        None
+                    };
+                    let mut msg = crate::util::format_not_found_error(
                         &display_path,
                         &path,
                         &cwd,
                         &display_dcwd,
-                        hints_enabled,
+                        hints_enabled && verified_skill_suggestion.is_none(),
                     )
                     .await;
+                    if let Some(suggestion) = verified_skill_suggestion {
+                        msg.push_str("\nThe skill you are looking for is registered at:\n");
+                        msg.push_str(&suggestion.display_path.to_string_lossy());
+                    }
                     ReadFileOutput::FileNotFound(msg)
                 }
                 Some(std::io::ErrorKind::IsADirectory) => ReadFileOutput::IsADirectory(format!(
@@ -414,14 +424,35 @@ pub(crate) async fn run_read_file(
             });
         }
     };
+    if let Err(error) =
+        crate::types::memory_v2::record_memory_v2_read(&resources, &policy_path, &file_bytes).await
+    {
+        return Ok(ReadFileOutput::FileReadError(error));
+    }
     if let Ok(metadata) = bytes_to_metadata(&file_bytes)
         && metadata.is_image()
     {
-        return Ok(crate::implementations::read_file::image::image_read_output(
-            file_bytes,
-            metadata.mime_type,
-        )
-        .await);
+        if crate::implementations::read_file::should_embed_as_conversation_image(
+            &path,
+            &file_bytes,
+            &metadata.mime_type,
+        ) {
+            return Ok(crate::implementations::read_file::image::image_read_output(
+                file_bytes,
+                metadata.mime_type,
+            )
+            .await);
+        }
+        if let Some(svg_text) = crate::implementations::read_file::extract_svg_text(&file_bytes) {
+            file_bytes = svg_text.into_bytes();
+        } else {
+            return Ok(
+                ReadFileOutput::ImageSizeError(
+                    "Could not embed image in conversation: SVG or incomplete PNG preview cannot be sent as an image"
+                        .to_owned(),
+                ),
+            );
+        }
     }
     let extension = path
         .extension()
@@ -575,11 +606,8 @@ pub(crate) async fn run_read_file(
         extracted_images,
     }))
 }
-/// New-architecture `ReadFile` tool.
-///
-/// Params: `()` — no per-tool configuration.
-///
-/// Notifications: Emits `FileRead` via `NotificationHandle`.
+/// New-architecture `ReadFile` tool. Params: `()` — no per-tool configuration. Notifications: Emits
+/// `FileRead` via `NotificationHandle`.
 #[derive(Default, Debug)]
 pub struct ReadFileTool;
 impl crate::types::tool_metadata::ToolMetadata for ReadFileTool {
@@ -614,10 +642,9 @@ impl xai_tool_runtime::Tool for ReadFileTool {
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
         READ_FILE_CAPABILITIES.clone()
     }
-    /// Streaming entry point. Only the line-oriented text path streams: the
-    /// final `content` is replayed as char-aligned deltas whose concatenation
-    /// reproduces the card byte-for-byte; image/PDF/PPTX stay terminal-only.
-    /// Gated by `WorkspaceViewerContext::stream_tool_progress`.
+    /// Streaming entry point. Only the line-oriented text path streams: the final `content` is
+    /// replayed as char-aligned deltas whose concatenation reproduces the card byte-for-byte;
+    /// image/PDF/PPTX stay terminal-only. Gated by `WorkspaceViewerContext::stream_tool_progress`.
     async fn execute(
         &self,
         ctx: xai_tool_runtime::ToolCallContext,
@@ -723,8 +750,8 @@ mod tests {
     use crate::computer::local::LocalFs;
     use crate::implementations::read_file::MAX_PDF_BYTES;
     use crate::implementations::read_file::compress_image_for_conversation;
+    use crate::implementations::skills::types::SkillInfo;
     use crate::notification::types::ToolNotificationHandle;
-    #[allow(unused_imports)]
     use crate::types::resources::{NotificationHandle, Resources};
     use crate::types::tool_metadata::test_ctx;
     use std::sync::Arc;
@@ -817,6 +844,138 @@ mod tests {
             }
             other => panic!("Expected FileNotFound, got {:?}", other),
         }
+    }
+    fn seeded_manager(skills: Vec<SkillInfo>) -> SkillManager {
+        let mut manager = SkillManager::new();
+        manager.seed(None, None, skills, None, None, None);
+        manager
+    }
+    async fn not_found_msg(resources: Resources, path: &str) -> String {
+        let input = ReadFileInput {
+            path: path.to_owned(),
+            offset: None,
+            limit: None,
+            pages: None,
+            format: None,
+        };
+        let result =
+            xai_tool_runtime::Tool::run(&ReadFileTool, test_ctx(resources.into_shared()), input)
+                .await
+                .unwrap();
+        match result {
+            ReadFileOutput::FileNotFound(msg) => msg,
+            other => panic!("Expected FileNotFound, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn missing_skill_read_suggests_registered_path() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".grok/skills/code-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, "# Code review\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![SkillInfo {
+            name: "code-review".to_owned(),
+            path: skill_path.to_string_lossy().into_owned(),
+            disable_model_invocation: true,
+            ..SkillInfo::default()
+        }]));
+        let msg = not_found_msg(resources, "/wrong/root/skills/code-review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/skills/code-review/SKILL.md does not exist.\n\
+                 The skill you are looking for is registered at:\n{}",
+                skill_path.display()
+            )
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_uses_display_path() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".grok/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, "# Review\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(DisplayCwd(std::path::PathBuf::from("/display/project")));
+        let mut manager = SkillManager::new();
+        manager.seed(
+            Some(tmp.path().to_path_buf()),
+            None,
+            vec![SkillInfo {
+                name: "review".to_owned(),
+                path: skill_path.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            }],
+            Some("/display/project".to_owned()),
+            None,
+            None,
+        );
+        resources.insert(manager);
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            "Error: /wrong/root/review/SKILL.md does not exist.\n\
+             The skill you are looking for is registered at:\n\
+             /display/project/.grok/skills/review/SKILL.md"
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_omits_ambiguous_suggestion() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("first/review/SKILL.md");
+        let second = tmp.path().join("second/review/SKILL.md");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, "# First\n").unwrap();
+        std::fs::write(&second, "# Second\n").unwrap();
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![
+            SkillInfo {
+                name: "review".to_owned(),
+                path: first.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            },
+            SkillInfo {
+                name: "review".to_owned(),
+                path: second.to_string_lossy().into_owned(),
+                ..SkillInfo::default()
+            },
+        ]));
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/review/SKILL.md does not exist.\n\
+                 Note: your current working directory is {}",
+                tmp.path().display()
+            )
+        );
+    }
+    #[tokio::test]
+    async fn missing_skill_read_omits_stale_registered_path() {
+        let tmp = TempDir::new().unwrap();
+        let stale_path = tmp.path().join(".grok/skills/review/SKILL.md");
+        let mut resources = test_resources(tmp.path());
+        resources.insert(PathNotFoundHints(true));
+        resources.insert(seeded_manager(vec![SkillInfo {
+            name: "review".to_owned(),
+            path: stale_path.to_string_lossy().into_owned(),
+            ..SkillInfo::default()
+        }]));
+        let msg = not_found_msg(resources, "/wrong/root/review/SKILL.md").await;
+        assert_eq!(
+            msg,
+            format!(
+                "Error: /wrong/root/review/SKILL.md does not exist.\n\
+                 Note: your current working directory is {}",
+                tmp.path().display()
+            )
+        );
     }
     #[tokio::test]
     async fn legacy_read_file_directory_returns_exact_historical_message() {
@@ -1134,10 +1293,9 @@ mod tests {
         assert_eq!(extracted.content_concise, "1→1\n2\n3\n");
         assert_eq!(extracted.raw_output, "1\n2\r\n3\n");
     }
-    /// Regression: a long single-line base64 URI used to be cut
-    /// mid-payload by the (since-removed) per-line clip and re-emitted as
-    /// a corrupt vision token. Pin that the full payload is captured
-    /// byte-equal.
+    /// Regression: a long single-line base64 URI used to be cut mid-payload by the (since-removed)
+    /// per-line clip and re-emitted as a corrupt vision token. Pin that the full payload is
+    /// captured byte-equal.
     #[test]
     fn extract_captures_long_inline_base64_image_before_truncation() {
         let payload = "A".repeat(50_000);
@@ -1262,6 +1420,68 @@ mod tests {
             mime_type: "".to_string(),
         };
         assert!(!metadata.is_image());
+    }
+    #[tokio::test]
+    async fn read_file_adobe_svg_with_truncated_png_prefix_reads_as_text() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = crate::implementations::read_file::metadata::truncated_png_then_svg();
+        std::fs::write(tmp.path().join("baidu.svg"), &bytes).unwrap();
+        let tool = ReadFileTool;
+        let resources = test_resources(tmp.path());
+        let input = ReadFileInput {
+            path: "baidu.svg".to_string(),
+            offset: None,
+            limit: None,
+            pages: None,
+            format: None,
+        };
+        let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
+            .await
+            .unwrap();
+        match result {
+            ReadFileOutput::FileContent(content) => {
+                assert!(
+                    content.raw_output.contains("<svg"),
+                    "must read SVG markup, not embed the thumbnail: {content:?}"
+                );
+                assert!(content.raw_output.contains("baidu"));
+                assert!(
+                    !content.raw_output.contains('\u{FFFD}'),
+                    "PNG prefix must not leak into the text read"
+                );
+            }
+            ReadFileOutput::ImageContent(_) => {
+                panic!("Adobe SVG must not take the PNG image-embed path")
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn read_file_truncated_png_prefix_svg_without_markup_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let png = crate::implementations::read_file::metadata::truncated_png_prefix();
+        std::fs::write(tmp.path().join("preview.svg"), &png).unwrap();
+        let tool = ReadFileTool;
+        let resources = test_resources(tmp.path());
+        let input = ReadFileInput {
+            path: "preview.svg".to_string(),
+            offset: None,
+            limit: None,
+            pages: None,
+            format: None,
+        };
+        let result = xai_tool_runtime::Tool::run(&tool, test_ctx(resources.into_shared()), input)
+            .await
+            .unwrap();
+        match result {
+            ReadFileOutput::ImageSizeError(msg) => {
+                assert!(msg.contains("incomplete PNG") || msg.contains("SVG"));
+            }
+            ReadFileOutput::ImageContent(_) => {
+                panic!("incomplete PNG preview on .svg must not embed")
+            }
+            other => panic!("expected ImageSizeError, got {other:?}"),
+        }
     }
     fn build_gitignore(root: &std::path::Path, patterns: &[&str]) -> ignore::gitignore::Gitignore {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
@@ -1644,37 +1864,6 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
         buf.into_inner()
-    }
-    fn make_small_png(width: u32, height: u32) -> Vec<u8> {
-        use image::{ImageBuffer, Rgba};
-        let img = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 255]));
-        let mut buf = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
-        buf.into_inner()
-    }
-    #[test]
-    fn compress_small_image_returns_unchanged() {
-        let png = make_small_png(16, 16);
-        let (result, mime) =
-            compress_image_for_conversation(png.clone(), "image/png".into()).unwrap();
-        assert_eq!(result, png);
-        assert_eq!(mime, "image/png");
-    }
-    #[test]
-    fn compress_large_noisy_image_picks_jpeg() {
-        let png = make_noisy_png(2048, 1536);
-        let b64_before = (png.len() * 4).div_ceil(3);
-        assert!(
-            b64_before > MAX_IMAGE_PAYLOAD_BYTES,
-            "test image ({b64_before} B b64) must exceed the payload limit"
-        );
-        let (result, mime) = compress_image_for_conversation(png, "image/png".into()).unwrap();
-        assert_eq!(mime, "image/jpeg");
-        let b64_after = (result.len() * 4).div_ceil(3);
-        assert!(
-            b64_after <= MAX_IMAGE_PAYLOAD_BYTES,
-            "compressed image ({b64_after} B b64) must fit within {MAX_IMAGE_PAYLOAD_BYTES} B"
-        );
     }
     #[test]
     fn compress_flat_color_picks_png() {
@@ -2283,11 +2472,9 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
             other => panic!("expected FileContent, got {other:?}"),
         }
     }
-    /// Regression for the "death spiral" incident: a single-line
-    /// ~49.5KB JSON payload must be readable in full with default config.
-    /// The old 2000-char per-line clip made such files unreadable by
-    /// construction (bash output and MCP results are byte-capped too), so the
-    /// model could never load a payload it needed to re-emit as tool input.
+    /// Regression for the "death spiral" incident: a single-line ~49.5KB JSON payload must be readable in full with default
+    /// config. The old 2000-char per-line clip made such files unreadable by construction (bash output and MCP results are
+    /// byte-capped too), so the model could never load a payload it needed to re-emit as tool input.
     #[tokio::test]
     async fn single_line_payload_reads_in_full_by_default() {
         let tmp = TempDir::new().unwrap();

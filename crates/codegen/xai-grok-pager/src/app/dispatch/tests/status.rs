@@ -2,28 +2,20 @@
 
 use super::*;
 
-/// Regression (leader-mode turn-end race): when this client is briefly Idle
-/// (`is_turn_running() == false`, `current_prompt_id` cleared) but the server
-/// still has queued prompts — visible as a non-empty `shared_queue` mirror —
-/// a newly-sent prompt must route to the SERVER (immediate-send), NOT be
-/// locally drained as a phantom running turn. The failure mode: a
-/// `send_route_plain immediate=false is_turn_running=false shared_queue_len=5`
-/// path taking `local_drain`, leaving the prompt shown running on the sender
-/// while it was actually queued behind the existing entries on the leader and
-/// every other client.
+/// Regression for the leader-mode turn-end race: this client is briefly Idle while the server still has queued prompts.
+/// Idle here means `is_turn_running() == false` with `current_prompt_id` cleared; the server's queue is visible as a non-empty `shared_queue` mirror.
+/// A newly-sent prompt must route to the server (immediate-send), not drain locally as a phantom running turn.
 #[test]
 fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
-    // Two prompts already queued on the server (as a broadcast would leave
-    // things): populate the authoritative map AND mirror it into the agent.
+    // Two prompts already queued on the server (as a broadcast would leave things): populate the authoritative map and mirror it into the agent
     app.push_optimistic_prompt_echo("test-session", "q1", "a", "prompt");
     app.push_optimistic_prompt_echo("test-session", "q2", "b", "prompt");
     {
         let snapshot = app.shared_prompt_queue("test-session").cloned().unwrap();
         let agent = app.agents.get_mut(&id).unwrap();
-        // Turn-end window: locally Idle with no current prompt, but the
-        // server's queue (mirrored from the last broadcast) still has work.
+        // Turn-end window: locally Idle with no current prompt, but the server's queue (mirrored from the last broadcast) still has work
         agent.session.state = AgentState::Idle;
         agent.session.current_prompt_id = None;
         agent.shared_queue = snapshot;
@@ -42,7 +34,7 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("expected immediate SendPrompt for 'c', got {effects:?}"));
-    // Did NOT start a local turn or adopt "c" as the running prompt.
+    // The dispatch did not start a local turn or adopt "c" as the running prompt
     assert!(
         !app.agents[&id].session.state.is_turn_running(),
         "must not promote 'c' to a local running turn"
@@ -51,7 +43,7 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
         app.agents[&id].session.current_prompt_id.is_none(),
         "must not set current_prompt_id locally for a server-queued prompt"
     );
-    // Echoed into the shared queue BEHIND the existing entries (position 3).
+    // Echoed into the shared queue behind the existing entries (position 3)
     let q = app
         .shared_prompt_queue("test-session")
         .expect("optimistic echo present");
@@ -60,42 +52,35 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     assert_eq!(q.last().map(|e| e.text.as_str()), Some("c"));
 }
 
-// ── coding_data_sharing dispatch tests ───
-//
-// The dispatcher uses **optimistic + rollback**, matching the
-// `set_yolo_mode` pattern minus its toasts — the surfaces that change this
-// setting show the result themselves. These tests pin the contract:
-//   - Guards (ZDR, non-admin team) toast and short-circuit; they are the
-//     only paths that still speak up, because nothing else on screen would.
-//   - Idempotent dispatch emits no Effect and says nothing.
-//   - Optimistic mutation flips `app.coding_data_retention_opt_out`
-//     BEFORE the Effect is emitted.
-//   - `Effect::SetCodingDataSharing` carries
-//     `rollback_to_opted_in = previous_value`.
-//   - `TaskResult::CodingDataSharingFailed` reverts the optimistic
-//     mutation; `TaskResult::CodingDataSharingUpdated` re-anchors
-//     to the server-confirmed value.
+// coding data sharing dispatch tests
+// The dispatcher mutates optimistically and rolls back on failure, matching the `set_yolo_mode` pattern minus its toasts
+// Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
 
-/// Idempotent re-dispatch skips the ACP round-trip.
+/// Idle unchanged opt-in skips ACP and still acks.
+/// Already-out is covered by `settings_opt_out_while_already_out_acks_without_write`.
 #[test]
-fn set_coding_data_sharing_idempotent_is_silent_and_effect_free() {
-    for opted_in in [true, false] {
-        let mut app = test_app_with_agent();
-        app.coding_data_retention_opt_out = !opted_in; // already at the target
-        let effects = dispatch(Action::SetCodingDataSharing { opted_in }, &mut app);
-        assert!(
-            effects.is_empty(),
-            "idempotent re-dispatch must NOT emit Effect (opted_in={opted_in})"
-        );
-        assert!(
-            app.agents[&AgentId(0)].toast.is_none(),
-            "idempotent re-dispatch must not toast (opted_in={opted_in})"
-        );
-        assert_eq!(
-            app.coding_data_retention_opt_out, !opted_in,
-            "idempotent path must not mutate state (opted_in={opted_in})",
-        );
-    }
+fn set_coding_data_sharing_unchanged_opt_in_skips_acp_and_acks() {
+    let mut app = test_app_with_agent();
+    app.privacy_notice_rollout = true;
+    app.coding_data_retention_opt_out = false;
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "idle unchanged opt-in must still ack: {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+        "idle unchanged opt-in must NOT write ACP: {effects:?}"
+    );
+    assert!(app.agents[&AgentId(0)].toast.is_none());
+    assert!(!app.coding_data_retention_opt_out);
+    assert!(app.privacy_banner_acked.is_some());
+    assert!(!app.privacy_banner_opt_in_inflight);
+    assert_eq!(app.coding_data_write_seq, 0);
 }
 
 /// ZDR teams are blocked from toggling. The blocked path
@@ -107,6 +92,11 @@ fn set_coding_data_sharing_blocked_by_zdr() {
     app.coding_data_retention_opt_out = false;
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
     assert!(effects.is_empty(), "ZDR block must NOT emit Effect");
+    assert!(
+        app.privacy_banner_acked.is_none(),
+        "ZDR block must not ack the banner"
+    );
+    assert!(!app.privacy_banner_opt_in_inflight);
     let toast = read_toast(&app);
     assert!(
         toast.contains("Zero Data Retention"),
@@ -116,17 +106,15 @@ fn set_coding_data_sharing_blocked_by_zdr() {
         toast.contains('\u{2717}'),
         "blocked toast uses ✗ glyph: {toast}"
     );
-    // State unchanged — the user was blocked, the optimistic
-    // mutation never happened.
+    // State unchanged: the user was blocked, so the optimistic mutation never happened
     assert!(
         !app.coding_data_retention_opt_out,
         "ZDR block must not mutate state",
     );
 }
 
-/// ZDR block fires even when the toggle would be a no-op
-/// (defense-in-depth: don't quietly accept a same-value toggle
-/// from a user the policy says shouldn't be touching this).
+/// ZDR block fires even when the toggle would be a no-op.
+/// Defense-in-depth: don't quietly accept a same-value toggle from a user the policy says shouldn't be touching this.
 #[test]
 fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
     let mut app = test_app_with_agent();
@@ -134,11 +122,13 @@ fn set_coding_data_sharing_blocked_by_zdr_even_if_idempotent() {
     app.coding_data_retention_opt_out = false;
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
     assert!(effects.is_empty());
+    assert!(app.privacy_banner_acked.is_none());
+    assert!(!app.privacy_banner_opt_in_inflight);
     assert!(read_toast(&app).contains("Zero Data Retention"));
 }
 
-/// Non-admin team members are blocked from toggling (matches
-/// desktop). The blocked path toasts and short-circuits.
+/// Non-admin team members are blocked from toggling (matches desktop).
+/// The blocked path toasts and short-circuits.
 #[test]
 fn set_coding_data_sharing_blocked_non_admin() {
     let mut app = test_app_with_agent();
@@ -147,6 +137,8 @@ fn set_coding_data_sharing_blocked_non_admin() {
     app.coding_data_retention_opt_out = false;
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
     assert!(effects.is_empty());
+    assert!(app.privacy_banner_acked.is_none());
+    assert!(!app.privacy_banner_opt_in_inflight);
     let toast = read_toast(&app);
     assert!(
         toast.contains("team admin"),
@@ -154,8 +146,8 @@ fn set_coding_data_sharing_blocked_non_admin() {
     );
 }
 
-/// Admin team members CAN toggle. The admin-allowed path produces
-/// an Effect carrying the rollback value.
+/// Admin team members can toggle.
+/// The admin-allowed path produces an Effect carrying the rollback value.
 #[test]
 fn set_coding_data_sharing_allowed_for_admin() {
     let mut app = test_app_with_agent();
@@ -163,43 +155,60 @@ fn set_coding_data_sharing_allowed_for_admin() {
     app.team_role = Some("Admin".into());
     app.coding_data_retention_opt_out = false; // currently opted-in
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
-    assert_eq!(effects.len(), 1);
-    match &effects[0] {
-        Effect::SetCodingDataSharing {
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "rollout-off admin opt-out must not ack: {effects:?}"
+    );
+    match effects
+        .iter()
+        .find(|e| matches!(e, Effect::SetCodingDataSharing { .. }))
+    {
+        Some(Effect::SetCodingDataSharing {
             opted_in,
             rollback_to_opted_in,
             ..
-        } => {
+        }) => {
             assert!(!*opted_in, "Effect must carry opted_in=false");
             assert!(
                 *rollback_to_opted_in,
                 "rollback_to_opted_in must capture pre-toggle opt-in=true",
             );
         }
-        other => panic!("expected SetCodingDataSharing Effect, got {other:?}"),
+        other => panic!("expected SetCodingDataSharing Effect, got {effects:?} ({other:?})"),
     }
     // Optimistic mutation already applied.
     assert!(
         app.coding_data_retention_opt_out,
         "admin-allowed dispatch must optimistically flip state",
     );
+    assert!(app.privacy_banner_acked.is_none());
+    assert!(!app.privacy_banner_opt_in_inflight);
 }
 
-/// Non-idempotent dispatch emits one Effect AND mutates state
-/// optimistically.
+/// Non-idempotent dispatch emits one Effect and mutates state optimistically.
 #[test]
 fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
     let mut app = test_app_with_agent();
     app.coding_data_retention_opt_out = false; // currently opted-in
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
-    assert_eq!(effects.len(), 1, "non-idempotent dispatch emits one Effect");
-    match &effects[0] {
-        Effect::SetCodingDataSharing {
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "rollout-off changed opt-out must not ack: {effects:?}"
+    );
+    match effects
+        .iter()
+        .find(|e| matches!(e, Effect::SetCodingDataSharing { .. }))
+    {
+        Some(Effect::SetCodingDataSharing {
             agent_id,
             opted_in,
             rollback_to_opted_in,
             seq,
-        } => {
+        }) => {
             assert_eq!(*agent_id, AgentId(0));
             assert!(!*opted_in);
             assert!(
@@ -211,21 +220,22 @@ fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
                 "the effect must carry the generation it was dispatched under",
             );
         }
-        other => panic!("expected SetCodingDataSharing Effect, got {other:?}"),
+        other => panic!("expected SetCodingDataSharing Effect, got {effects:?} ({other:?})"),
     }
     // Optimistic mutation applied.
     assert!(
         app.coding_data_retention_opt_out,
         "dispatch must optimistically mutate state",
     );
+    assert!(app.privacy_banner_acked.is_none());
+    assert!(!app.privacy_banner_opt_in_inflight);
     assert!(
         app.agents[&AgentId(0)].toast.is_none(),
         "changing this setting must not toast — the settings row is the feedback",
     );
 }
 
-/// `TaskResult::CodingDataSharingUpdated` re-anchors state to the
-/// server-confirmed value (defense-in-depth).
+/// `TaskResult::CodingDataSharingUpdated` re-anchors state to the server-confirmed value (defense-in-depth).
 #[test]
 fn coding_data_sharing_updated_re_anchors_state() {
     let mut app = test_app_with_agent();
@@ -251,14 +261,12 @@ fn coding_data_sharing_updated_re_anchors_state() {
     );
 }
 
-/// `TaskResult::CodingDataSharingUpdated` corrects the in-memory
-/// state if the server reshapes the boolean (e.g. policy
-/// override). Pins the defense-in-depth re-anchor contract.
+/// `TaskResult::CodingDataSharingUpdated` corrects the in-memory state if the server reshapes the boolean (e.g. policy override).
+/// Pins the defense-in-depth re-anchor contract.
 #[test]
 fn coding_data_sharing_updated_corrects_state_if_server_disagrees() {
     let mut app = test_app_with_agent();
-    // Optimistic mutation said "opt-out" — but the server
-    // overrides to "opt-in" (e.g. policy that prevents opt-out).
+    // Optimistic mutation said "opt-out", but the server overrides to "opt-in" (e.g. policy that prevents opt-out).
     app.coding_data_retention_opt_out = true;
     let id = AgentId(0);
     let seq = app.coding_data_write_seq;
@@ -278,18 +286,14 @@ fn coding_data_sharing_updated_corrects_state_if_server_disagrees() {
     );
 }
 
-/// `TaskResult::CodingDataSharingFailed` REVERTS the optimistic
-/// mutation and surfaces a failure toast. Pins the rollback
-/// contract.
-///
-/// Failure toast uses the standardised "coding data sharing"
-/// wording.
+/// `TaskResult::CodingDataSharingFailed` reverts the optimistic mutation and shows a failure toast.
+/// Pins the rollback contract.
+/// The failure toast uses the standardised "coding data sharing" wording.
 #[test]
 fn coding_data_sharing_failed_rolls_back_and_toasts_error() {
     let mut app = test_app_with_agent();
-    // Simulate post-optimistic state: user picked opt-out, state
-    // was flipped, then the ACP call failed. The pre-toggle value
-    // was opt-in (true), so `rollback_to_opted_in = true`.
+    // Simulate post-optimistic state: the user picked opt-out, state was flipped, then the ACP call failed
+    // The pre-toggle value was opt-in (true), so `rollback_to_opted_in = true`
     app.coding_data_retention_opt_out = true;
     let id = AgentId(0);
     let seq = app.coding_data_write_seq;
@@ -319,13 +323,11 @@ fn coding_data_sharing_failed_rolls_back_and_toasts_error() {
     assert!(toast.contains('\u{2717}'), "failure toast uses ✗: {toast}");
 }
 
-/// `TaskResult::CodingDataSharingFailed` reverts in the OTHER
-/// direction too (the pre-toggle state could have been either).
+/// `TaskResult::CodingDataSharingFailed` reverts in the other direction too (the pre-toggle state could have been either).
 #[test]
 fn coding_data_sharing_failed_rolls_back_to_opt_out() {
     let mut app = test_app_with_agent();
-    // Post-optimistic: opted-in (user picked opt-in, server
-    // failed, pre-toggle was opt-out).
+    // Post-optimistic: opted-in (the user picked opt-in, the server failed, pre-toggle was opt-out)
     app.coding_data_retention_opt_out = false;
     let id = AgentId(0);
     let seq = app.coding_data_write_seq;
@@ -347,8 +349,7 @@ fn coding_data_sharing_failed_rolls_back_to_opt_out() {
 }
 
 /// Optimistic mutation refreshes any open settings modal.
-/// Without this refresh, the modal indicator would stay at the
-/// pre-toggle value until manual re-render.
+/// Without this refresh, the modal indicator would stay at the pre-toggle value until a manual re-render.
 #[test]
 fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
     let mut app = test_app_with_agent();
@@ -380,8 +381,7 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
     );
 }
 
-/// Rollback also refreshes the modal — the user sees the
-/// reverted value, not the stale optimistic one.
+/// Rollback also refreshes the modal: the user sees the reverted value, not the stale optimistic one.
 #[test]
 fn coding_data_sharing_failed_refreshes_open_modal_snapshot() {
     let mut app = test_app_with_agent();
@@ -424,16 +424,14 @@ fn set_coding_data_sharing_is_silent_in_both_directions() {
     }
 }
 
-/// The failure toast
-/// substitutes a generic placeholder when the error string is
-/// too long OR contains control characters / newlines. Pins the
-/// scrub contract.
+/// The failure toast substitutes a generic placeholder when the error string is too long or contains control characters / newlines.
+/// Pins the scrub contract.
 #[test]
 fn coding_data_sharing_failed_scrubs_long_error_messages() {
     let mut app = test_app_with_agent();
     app.coding_data_retention_opt_out = true;
     let id = AgentId(0);
-    // ~500-char error simulating a stack trace / HTML 502 page.
+    // A roughly 500-char error simulating a stack trace / HTML 502 page
     let huge_error = "a".repeat(500);
     let seq = app.coding_data_write_seq;
     let _ = dispatch(
@@ -457,9 +455,8 @@ fn coding_data_sharing_failed_scrubs_long_error_messages() {
     );
 }
 
-/// Control characters (CR/LF/NUL)
-/// in the error trigger the scrub path even on short strings —
-/// preserves the toast's single-line layout.
+/// Control characters (CR/LF/NUL) in the error trigger the scrub path even on short strings.
+/// This preserves the toast's single-line layout.
 #[test]
 fn coding_data_sharing_failed_scrubs_control_chars_in_error() {
     let mut app = test_app_with_agent();
@@ -489,9 +486,8 @@ fn coding_data_sharing_failed_scrubs_control_chars_in_error() {
     );
 }
 
-/// The scrub path preserves short,
-/// sanitised error messages verbatim — the typical happy-path
-/// shell-side error string stays unscrubbed.
+/// The scrub path preserves short, sanitised error messages verbatim.
+/// The typical happy-path shell-side error string stays unscrubbed.
 #[test]
 fn coding_data_sharing_failed_preserves_short_clean_error_message() {
     let mut app = test_app_with_agent();
@@ -519,11 +515,10 @@ fn coding_data_sharing_failed_preserves_short_clean_error_message() {
     );
 }
 
-/// Direct unit test of the `scrub_error_for_toast` helper —
-/// pins the threshold and the fallback string against drift.
+/// Direct unit test of the `scrub_error_for_toast` helper; pins the threshold and the fallback string against drift.
 #[test]
 fn scrub_error_for_toast_unit() {
-    // Empty + short messages pass through.
+    // Empty and short messages pass through
     assert_eq!(scrub_error_for_toast(""), "");
     assert_eq!(scrub_error_for_toast("ok"), "ok");
     assert_eq!(scrub_error_for_toast("network timeout"), "network timeout");
@@ -545,11 +540,8 @@ fn scrub_error_for_toast_unit() {
         scrub_error_for_toast("hi\rthere"),
         "server error (see logs for details)"
     );
-    // Format-category (Cf) chars also trigger scrub — bidi
-    // overrides, zero-width joiner / space, BOM. Prevents
-    // Trojan-Source-style visual spoofing
-    // where a toast READS as one thing but bytes encode
-    // another via embedded RIGHT-TO-LEFT-OVERRIDE.
+    // Format-category (Cf) chars also trigger scrub: bidi overrides, zero-width joiner / space, BOM
+    // This prevents Trojan-Source-style spoofing: a toast that reads as one thing while the bytes encode another via a RIGHT-TO-LEFT OVERRIDE
     assert_eq!(
         scrub_error_for_toast("opt\u{202E}-out"),
         "server error (see logs for details)",
@@ -582,9 +574,18 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
     let effects = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
     assert_eq!(effects.len(), 1, "no-agent path must still emit Effect");
     assert!(
+        matches!(
+            &effects[0],
+            Effect::SetCodingDataSharing { opted_in: true, .. }
+        ),
+        "changed opt-in must be the ACP write, not an early ack: {effects:?}"
+    );
+    assert!(
         !app.coding_data_retention_opt_out,
         "optimistic opt-in must apply without agents",
     );
+    assert!(app.privacy_banner_opt_in_inflight);
+    assert!(app.privacy_banner_acked.is_none());
 }
 
 fn privacy_banner_ready_app() -> AppView {
@@ -657,6 +658,7 @@ fn privacy_banner_opt_in_success_acks() {
     );
     assert!(!app.privacy_banner_opt_in_inflight);
     assert!(app.privacy_banner_acked.is_some());
+    assert!(!app.privacy_banner_should_show());
     assert!(
         ack_effects
             .iter()
@@ -689,6 +691,10 @@ fn privacy_banner_opt_in_failure_no_ack_sets_welcome_toast() {
     assert!(
         app.coding_data_retention_opt_out,
         "rollback restores opt-out"
+    );
+    assert!(
+        app.privacy_banner_should_show(),
+        "failed [Opt in] must leave the banner eligible"
     );
     let toast = app
         .welcome_toast
@@ -734,9 +740,9 @@ fn privacy_banner_opt_out_noop_while_opt_in_inflight() {
     );
 }
 
-/// The ack must not hinge on the round trip, unlike `[Opt in]`'s.
+/// Already-out `[Opt out]` acks now and must not force an ACP write.
 #[test]
-fn privacy_banner_opt_out_acks_now_and_records_decline() {
+fn privacy_banner_opt_out_acks_now_without_write() {
     use crate::views::modal::ActiveModal;
     let mut app = privacy_banner_ready_app();
 
@@ -757,21 +763,15 @@ fn privacy_banner_opt_out_acks_now_and_records_decline() {
         "ack must persist: {effects:?}"
     );
     assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::SetCodingDataSharing {
-                opted_in: false,
-                rollback_to_opted_in: false,
-                ..
-            }
-        )),
-        "the decline rides the ordinary write, so its response re-anchors \
-         the mirror like every other one: {effects:?}"
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+        "already-out must not force an ACP write: {effects:?}"
     );
+    assert_eq!(app.coding_data_write_seq, 0, "already-out is not a write");
     assert!(
         !app.privacy_banner_opt_in_inflight,
-        "a best-effort write must not arm the opt-in inflight guard, which \
-         would block [Opt in] and confuse both ACP result handlers"
+        "opt-out must not arm the opt-in inflight guard"
     );
     assert!(
         app.coding_data_retention_opt_out,
@@ -785,18 +785,27 @@ fn privacy_banner_opt_out_acks_now_and_records_decline() {
     );
 }
 
-/// A superseded reply must not touch state. `[Opt out]` fires a write, the
-/// user opts in from settings before it lands, and only then does the stale
-/// decline answer: its `rollback_to_opted_in: false` was captured before the
-/// opt-in existed, so applying it would flip the pager to opted-out while
-/// the server holds opted-in — claiming data isn't retained when it is.
+/// A superseded reply must not touch state.
+/// Settings opt-out is write 1, the user opts in before it lands, and only then does the stale decline answer.
+/// That claims data isn't retained when it is. Its failure must not toast either.
 #[test]
 fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
     for stale_failed in [true, false] {
         let mut app = privacy_banner_ready_app();
+        app.coding_data_retention_opt_out = false;
 
-        // Write 1: the banner decline.
-        let _ = dispatch(Action::PrivacyBannerOptOut, &mut app);
+        // Write 1: Settings opt-out from currently in.
+        let write1 = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+        assert!(
+            write1.iter().any(|e| matches!(
+                e,
+                Effect::SetCodingDataSharing {
+                    opted_in: false,
+                    ..
+                }
+            )),
+            "write 1 must be a real opt-out: {write1:?}"
+        );
         assert_eq!(app.coding_data_write_seq, 1);
 
         // Write 2: the user opts in from settings, and it confirms.
@@ -817,7 +826,7 @@ fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
             TaskResult::CodingDataSharingFailed {
                 agent_id: AgentId(0),
                 error: "network timeout".into(),
-                rollback_to_opted_in: false,
+                rollback_to_opted_in: true,
                 seq: 1,
             }
         } else {
@@ -841,8 +850,7 @@ fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
     }
 }
 
-/// A double-click (or a stale frame's hit rect) must not send a second
-/// decline.
+/// A double-click (or a stale frame's hit rect) must not send a second decline.
 #[test]
 fn privacy_banner_opt_out_is_idempotent() {
     let mut app = privacy_banner_ready_app();
@@ -852,6 +860,168 @@ fn privacy_banner_opt_out_is_idempotent() {
         again.is_empty(),
         "second dismissal must be inert: {again:?}"
     );
+}
+
+/// Settings Opt out while already out (banner eligible): acks, no ACP write.
+#[test]
+fn settings_opt_out_while_already_out_acks_without_write() {
+    let mut app = privacy_banner_ready_app();
+    assert!(app.privacy_banner_should_show());
+    assert!(app.coding_data_retention_opt_out);
+
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "already-out Settings Opt out must ack: {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+        "already-out must not write ACP: {effects:?}"
+    );
+    assert!(app.privacy_banner_acked.is_some());
+    assert!(!app.privacy_banner_should_show());
+    assert!(app.coding_data_retention_opt_out);
+    assert!(!app.privacy_banner_opt_in_inflight);
+    assert_eq!(app.coding_data_write_seq, 0);
+}
+
+/// Settings Opt out while currently in: acks now and writes ACP.
+#[test]
+fn settings_opt_out_from_in_acks_now_and_writes() {
+    let mut app = privacy_banner_ready_app();
+    app.coding_data_retention_opt_out = false;
+    assert!(!app.privacy_banner_should_show());
+
+    let effects = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
+
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "changed opt-out must ack now: {effects:?}"
+    );
+    match effects
+        .iter()
+        .find(|e| matches!(e, Effect::SetCodingDataSharing { .. }))
+    {
+        Some(Effect::SetCodingDataSharing {
+            opted_in,
+            rollback_to_opted_in,
+            seq,
+            ..
+        }) => {
+            assert!(!*opted_in);
+            assert!(*rollback_to_opted_in);
+            assert_eq!(*seq, app.coding_data_write_seq);
+        }
+        other => panic!("expected SetCodingDataSharing, got {effects:?} ({other:?})"),
+    }
+    assert!(app.privacy_banner_acked.is_some());
+    assert!(app.coding_data_retention_opt_out);
+    assert!(!app.privacy_banner_should_show());
+    assert!(!app.privacy_banner_opt_in_inflight);
+}
+
+/// Re-committing Opt in while the first write is inflight must not ack.
+/// That ack would survive a later ACP failure and hide the banner.
+#[test]
+fn settings_opt_in_recommitted_while_inflight_does_not_ack() {
+    let mut app = privacy_banner_ready_app();
+    let first = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Effect::SetCodingDataSharing { opted_in: true, .. })),
+        "first commit must write: {first:?}"
+    );
+    assert!(
+        !first
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "first commit must not ack: {first:?}"
+    );
+    assert!(app.privacy_banner_opt_in_inflight);
+    assert!(app.privacy_banner_acked.is_none());
+    let seq = app.coding_data_write_seq;
+    assert_eq!(seq, 1);
+
+    let again = dispatch(Action::SetCodingDataSharing { opted_in: true }, &mut app);
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+        "re-commit while inflight must not ack: {again:?}"
+    );
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
+        "re-commit while inflight must not write again: {again:?}"
+    );
+    assert!(app.privacy_banner_opt_in_inflight);
+    assert_eq!(app.coding_data_write_seq, seq);
+    assert!(app.privacy_banner_acked.is_none());
+
+    let fail_effects = dispatch(
+        Action::TaskComplete(TaskResult::CodingDataSharingFailed {
+            agent_id: AgentId(0),
+            error: "server error".into(),
+            rollback_to_opted_in: false,
+            seq,
+        }),
+        &mut app,
+    );
+    assert!(fail_effects.is_empty());
+    assert!(!app.privacy_banner_opt_in_inflight);
+    assert!(app.privacy_banner_acked.is_none());
+    assert!(app.coding_data_retention_opt_out);
+    assert!(app.privacy_banner_should_show());
+}
+
+/// A Settings pick before the notice is rolled out must not stamp an ack that would hide the banner when the cohort turns on.
+#[test]
+fn settings_choice_does_not_ack_when_rollout_off() {
+    for opted_in in [true, false] {
+        let mut app = test_app_with_agent();
+        app.privacy_notice_rollout = false;
+        app.coding_data_retention_opt_out = true;
+        app.auth_state = AuthState::Done;
+        app.trust_state = TrustState::Done;
+        let effects = dispatch(Action::SetCodingDataSharing { opted_in }, &mut app);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+            "rollout-off must not persist ack (opted_in={opted_in}): {effects:?}"
+        );
+        assert!(
+            app.privacy_banner_acked.is_none(),
+            "rollout-off must not stamp ack (opted_in={opted_in})"
+        );
+        if opted_in {
+            let seq = app.coding_data_write_seq;
+            let ack_effects = dispatch(
+                Action::TaskComplete(TaskResult::CodingDataSharingUpdated {
+                    agent_id: AgentId(0),
+                    opted_in: true,
+                    seq,
+                }),
+                &mut app,
+            );
+            assert!(
+                !ack_effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::PersistPrivacyBannerAcked { .. })),
+                "rollout-off opt-in success must not ack: {ack_effects:?}"
+            );
+            assert!(app.privacy_banner_acked.is_none());
+        }
+    }
 }
 
 #[test]
@@ -864,22 +1034,301 @@ fn dispatch_rename_session_updates_display_name_locally() {
         Some("renamed via slash"),
         "/rename must also update local display_name cache"
     );
+    match &effects[0] {
+        Effect::RenameSession { kind, .. } => {
+            assert_eq!(
+                *kind,
+                xai_grok_shell::session::unified_list::SessionKind::Build,
+                "build-lane /rename must send kind=build"
+            );
+        }
+        other => panic!("expected RenameSession, got {other:?}"),
+    }
 }
 
-/// `ConfirmResetSetting { choice: Reset }` on a SHARED Bool
-/// target restores the Settings modal AND fires the typed
-/// `Action::SetCompactMode(default)` via recursive dispatch —
-/// the `Effect::PersistSetting` is the externally-observable
-/// signal. Also asserts the ui_snapshot was
-/// refreshed to the new (post-reset) value (symmetric with the
-/// Cancel test's snapshot assertion).
+#[test]
+fn dispatch_rename_session_strips_controls_before_display_name_and_effect() {
+    let mut app = test_app_with_agent();
+    let effects =
+        dispatch_rename_session(&mut app, "  Hello\u{1b}[31mWorld\u{07}\u{9b}C1  ".into());
+    assert_eq!(
+        app.agents[&AgentId(0)].display_name.as_deref(),
+        Some("Hello[31mWorldC1"),
+        "optimistic display_name must match the shell strip (no OSC/CSI/BEL/C1)"
+    );
+    match &effects[..] {
+        [Effect::RenameSession { title, .. }] => {
+            assert_eq!(title, "Hello[31mWorldC1");
+        }
+        other => panic!("expected one RenameSession, got {other:?}"),
+    }
+
+    let mut app = test_app_with_agent();
+    let effects = dispatch_rename_session(&mut app, "\u{1b}\u{07}\n\t".into());
+    assert!(
+        effects.is_empty(),
+        "control-only title must not emit RenameSession: {effects:?}"
+    );
+    assert!(
+        app.agents[&AgentId(0)].display_name.is_none(),
+        "control-only title must not paint a blank/dirty display_name"
+    );
+    assert!(
+        last_system_text(&app, AgentId(0)).contains("title must not be blank"),
+        "control-only title must surface the same failed-rename system block"
+    );
+}
+
+#[test]
+fn dispatch_rename_session_chat_kind_stamps_kind_chat() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    agent.chat_kind = true;
+    agent.conversation_entry = true;
+    let effects = dispatch_rename_session(&mut app, "chat rename".into());
+    match &effects[..] {
+        [Effect::RenameSession { kind, title, .. }] => {
+            assert_eq!(title, "chat rename");
+            assert_eq!(
+                *kind,
+                xai_grok_shell::session::unified_list::SessionKind::Chat,
+                "chat-lane /rename must send kind=chat"
+            );
+        }
+        other => panic!("expected one RenameSession, got {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_rename_session_sticky_chat_local_build_stays_build() {
+    let mut app = test_app_with_agent();
+    app.chat_mode = true;
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    // `chat_kind` is the sticky `--chat` UI bit; `conversation_entry = false` marks a local-disk history bypass, not a conversation
+    agent.chat_kind = true;
+    agent.conversation_entry = false;
+    let effects = dispatch_rename_session(&mut app, "local title".into());
+    match &effects[..] {
+        [Effect::RenameSession { kind, title, .. }] => {
+            assert_eq!(title, "local title");
+            assert_eq!(
+                *kind,
+                xai_grok_shell::session::unified_list::SessionKind::Build,
+                "history-bypass local build under sticky --chat must send kind=build"
+            );
+        }
+        other => panic!("expected one RenameSession, got {other:?}"),
+    }
+}
+
+#[test]
+fn rename_session_request_serializes_camel_case_kind() {
+    use crate::app::actions::RenameSessionRequest;
+    use xai_grok_shell::session::unified_list::SessionKind;
+
+    let build = serde_json::to_value(RenameSessionRequest::for_rename(
+        "sid".into(),
+        "T".into(),
+        "/repo".into(),
+        SessionKind::Build,
+    ))
+    .unwrap();
+    assert_eq!(
+        build,
+        serde_json::json!({
+            "sessionId": "sid",
+            "title": "T",
+            "cwd": "/repo",
+            "kind": "build",
+        })
+    );
+
+    let chat = serde_json::to_value(RenameSessionRequest::for_rename(
+        "cid".into(),
+        "Chat".into(),
+        "/tmp".into(),
+        SessionKind::Chat,
+    ))
+    .unwrap();
+    assert_eq!(
+        chat,
+        serde_json::json!({
+            "sessionId": "cid",
+            "title": "Chat",
+            "cwd": "/tmp",
+            "kind": "chat",
+        })
+    );
+
+    let unpin = serde_json::to_value(RenameSessionRequest::for_reset(
+        "sid".into(),
+        "/repo".into(),
+        SessionKind::Build,
+    ))
+    .unwrap();
+    assert_eq!(
+        unpin,
+        serde_json::json!({
+            "sessionId": "sid",
+            "title": "",
+            "cwd": "/repo",
+            "kind": "build",
+            "resetToAuto": true,
+        }),
+        "unpin must send empty title + resetToAuto so old shells reject blank"
+    );
+}
+
+#[test]
+fn dispatch_reset_session_title_clears_titles_and_emits_effect() {
+    let mut app = test_app_with_agent();
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.display_name = Some("Manual".into());
+        // Post-rename both caches hold the pin (fan-out / resume).
+        agent.generated_session_title = Some("Manual".into());
+    }
+    let effects = dispatch_reset_session_title(&mut app);
+    let agent = &app.agents[&AgentId(0)];
+    assert!(
+        agent.display_name.is_none(),
+        "optimistic unpin must clear display_name"
+    );
+    assert!(
+        agent.generated_session_title.is_none(),
+        "optimistic unpin must clear generated_session_title when it matches the pin"
+    );
+    assert_ne!(
+        crate::views::session_title::entry_title(agent),
+        "Manual",
+        "dashboard/tab entry_title must not stay the manual pin"
+    );
+    match &effects[..] {
+        [
+            Effect::ResetSessionTitle {
+                agent_id,
+                session_id,
+                cwd,
+                kind,
+                previous_display_name,
+                previous_generated_title,
+            },
+        ] => {
+            assert_eq!(*agent_id, AgentId(0));
+            assert_eq!(session_id.0.as_ref(), "test-session");
+            assert_eq!(cwd, std::path::Path::new("/tmp"));
+            assert_eq!(
+                *kind,
+                xai_grok_shell::session::unified_list::SessionKind::Build
+            );
+            assert_eq!(previous_display_name.as_deref(), Some("Manual"));
+            assert_eq!(previous_generated_title.as_deref(), Some("Manual"));
+        }
+        other => panic!("expected ResetSessionTitle, got {other:?}"),
+    }
+}
+
+#[test]
+fn dispatch_reset_session_title_never_manual_keeps_generated_title() {
+    let mut app = test_app_with_agent();
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.display_name = None;
+        agent.generated_session_title = Some("Auto".into());
+    }
+    let effects = dispatch_reset_session_title(&mut app);
+    let agent = &app.agents[&AgentId(0)];
+    assert!(agent.display_name.is_none());
+    assert_eq!(agent.generated_session_title.as_deref(), Some("Auto"));
+    assert_eq!(
+        crate::views::session_title::entry_title(agent),
+        "Auto",
+        "already-auto unpin must stay a UI no-op"
+    );
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::ResetSessionTitle {
+                kind: xai_grok_shell::session::unified_list::SessionKind::Build,
+                ..
+            }]
+        ),
+        "got {effects:?}"
+    );
+}
+
+#[test]
+fn dispatch_reset_session_title_sticky_chat_local_build_stays_build() {
+    let mut app = test_app_with_agent();
+    app.chat_mode = true;
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.chat_kind = true;
+        agent.conversation_entry = false;
+        agent.display_name = Some("Manual".into());
+        agent.generated_session_title = Some("Auto".into());
+    }
+    let effects = dispatch_reset_session_title(&mut app);
+    match &effects[..] {
+        [Effect::ResetSessionTitle { kind, .. }] => {
+            assert_eq!(
+                *kind,
+                xai_grok_shell::session::unified_list::SessionKind::Build,
+                "history-bypass local build under sticky --chat must unpin as build"
+            );
+        }
+        other => panic!("expected ResetSessionTitle, got {other:?}"),
+    }
+    assert!(app.agents[&AgentId(0)].display_name.is_none());
+    assert_eq!(
+        app.agents[&AgentId(0)].generated_session_title.as_deref(),
+        Some("Auto")
+    );
+}
+
+#[test]
+fn dispatch_reset_session_title_refuses_chat_kind() {
+    let mut app = test_app_with_agent();
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        agent.chat_kind = true;
+        agent.conversation_entry = true;
+        agent.display_name = Some("Chat title".into());
+        agent.generated_session_title = Some("Kept".into());
+    }
+    let scrollback_len_before = app.agents[&AgentId(0)].scrollback.len();
+    let effects = dispatch_reset_session_title(&mut app);
+    assert!(
+        effects.is_empty(),
+        "chat-kind unpin must not emit an effect, got {effects:?}"
+    );
+    let agent = &app.agents[&AgentId(0)];
+    assert_eq!(agent.display_name.as_deref(), Some("Chat title"));
+    assert_eq!(agent.generated_session_title.as_deref(), Some("Kept"));
+    assert_eq!(agent.scrollback.len(), scrollback_len_before + 1);
+    let last = agent
+        .scrollback
+        .entry(agent.scrollback.len() - 1)
+        .expect("last entry");
+    let text = match &last.block {
+        crate::scrollback::block::RenderBlock::System(b) => b.text.clone(),
+        other => panic!("expected System block, got {other:?}"),
+    };
+    assert!(
+        text.contains("Chat conversations have no auto-title to restore"),
+        "got: {text:?}"
+    );
+}
+
+/// `ConfirmResetSetting { choice: Reset }` on a shared Bool target restores the Settings modal.
+/// It also fires the typed `Action::SetCompactMode(default)` via recursive dispatch; the `Effect::PersistSetting` is the observable signal.
+/// Also asserts the ui_snapshot was refreshed to the new (post-reset) value (symmetric with the Cancel test's snapshot assertion).
 #[test]
 fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool() {
     use crate::settings::SettingValue;
     use crate::views::modal::{ActiveModal, ResetSettingsResult};
     let mut app = test_app_with_agent();
-    // Flip compact_mode to true so we can observe the reset back
-    // to its default (false).
+    // Flip compact_mode to true so we can observe the reset back to its default (false)
     let _ = dispatch(Action::SetCompactMode(true), &mut app);
     assert!(app.current_ui.compact_mode);
 
@@ -892,8 +1341,7 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
         &mut app,
     );
 
-    // Recursive dispatch into Action::SetCompactMode(false) emits
-    // the persist effect.
+    // Recursive dispatch into Action::SetCompactMode(false) emits the persist effect
     assert_eq!(effects.len(), 1);
     match &effects[0] {
         Effect::PersistSetting { key, value, .. } => {
@@ -904,8 +1352,7 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
     }
     // In-memory state is reset to the default.
     assert!(!app.current_ui.compact_mode);
-    // Modal is restored AND ui_snapshot reflects the new value
-    // (symmetric with the Cancel test).
+    // The modal is restored and ui_snapshot reflects the new value (symmetric with the Cancel test)
     let agent = app.agents.get(&AgentId(0)).expect("agent must exist");
     match &agent.active_modal {
         Some(ActiveModal::Settings { state }) => {
@@ -918,15 +1365,13 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
     }
 }
 
-/// `ConfirmResetSetting { choice: Reset }` on a SHARED Enum
-/// target (`theme`) dispatches `Action::SetTheme(default)` via
-/// recursive dispatch — verifies the action_for_reset Enum arm.
+/// `ConfirmResetSetting { choice: Reset }` on a shared Enum target (`theme`) dispatches `Action::SetTheme(default)` via recursive dispatch.
+/// Verifies the action_for_reset Enum arm.
 #[test]
 fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum() {
     use crate::settings::SettingValue;
     use crate::views::modal::ResetSettingsResult;
-    // SetTheme mutates the global theme cache — serialize with the
-    // other theme tests via the theme test lock.
+    // SetTheme mutates the global theme cache, so serialize with the other theme tests via the theme test lock
     with_theme_test_env(|| {
         let mut app = test_app_with_agent();
         // Flip theme to a non-default first.
@@ -942,7 +1387,7 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum(
             &mut app,
         );
 
-        // Reset → SetTheme("groknight") (the registered default).
+        // Reset dispatches SetTheme("groknight"), the registered default
         assert_eq!(effects.len(), 1);
         match &effects[0] {
             Effect::PersistSetting { key, value, .. } => {
@@ -953,6 +1398,119 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum(
         }
         assert_eq!(app.current_ui.theme.as_deref(), Some("groknight"));
     });
+}
+
+fn seed_scrolled_up(app: &mut AppView) {
+    let sb = &mut app.agents.get_mut(&AgentId(0)).unwrap().scrollback;
+    for i in 0..40 {
+        sb.push_block(RenderBlock::agent_message(format!("seed {i}")));
+    }
+    sb.prepare_layout(80, 8);
+    sb.goto_top();
+}
+
+fn current_usage_nonce(app: &AppView) -> u64 {
+    match app.agents[&AgentId(0)].active_modal.as_ref() {
+        Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state.fetch_nonce,
+        _ => 0,
+    }
+}
+
+fn complete_session_usage(app: &mut AppView) {
+    let nonce = current_usage_nonce(app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageComplete {
+            agent_id: AgentId(0),
+            session_id: "test-session".to_string().into(),
+            usage: Box::default(),
+            nonce,
+        }),
+        app,
+    );
+}
+
+fn context_info_response() -> xai_grok_shell::session::SessionInfoResponse {
+    use xai_grok_shell::session::acp_types::{ContextInfo, SessionInfoData};
+
+    xai_grok_shell::session::SessionInfoResponse {
+        session_id: "test-session".to_string(),
+        cwd: "/tmp/test".to_string(),
+        data: SessionInfoData {
+            agent_name: None,
+            model: Some("grok-build".to_string()),
+            model_display_name: None,
+            resolved_model_id: None,
+            model_fingerprint: None,
+            show_model_fingerprint: false,
+            api_backend: None,
+            conversation_id: None,
+            turns: 0,
+            turn_index: 0,
+            context: ContextInfo::default(),
+        },
+    }
+}
+
+#[test]
+fn stale_context_info_results_do_not_update_replaced_session() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let before = agent_scrollback_len(&app);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .bind_session_id("replacement".into());
+
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextInfoComplete {
+            agent_id: id,
+            session_id: "test-session".into(),
+            info: Box::new(context_info_response()),
+            nonce: Default::default(),
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextInfoFailed {
+            agent_id: id,
+            session_id: "test-session".into(),
+            error: "request failed".to_string(),
+            nonce: Default::default(),
+        }),
+        &mut app,
+    );
+
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn session_usage_page_flips_info_to_top() {
+    crate::appearance::cache::set_page_flip_on_send(true);
+    let mut app = test_app_with_agent();
+    // Scrollback flow is minimal-only.
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    app.usage_visible = false;
+    seed_scrolled_up(&mut app);
+    complete_session_usage(&mut app);
+    let sb = &mut app.agents.get_mut(&AgentId(0)).unwrap().scrollback;
+    sb.prepare_layout(80, 8);
+    assert!(sb.is_follow_preserve_scroll());
+    let pinned = sb.scroll_offset();
+    sb.scroll_to_entry_top(sb.len() - 1);
+    assert_eq!(sb.scroll_offset(), pinned);
+}
+
+#[test]
+fn session_usage_keeps_scroll_when_page_flip_off() {
+    let prev = crate::appearance::cache::load_page_flip_on_send();
+    crate::appearance::cache::set_page_flip_on_send(false);
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    app.usage_visible = false;
+    seed_scrolled_up(&mut app);
+    complete_session_usage(&mut app);
+    assert_eq!(app.agents[&AgentId(0)].scrollback.scroll_offset(), 0);
+    crate::appearance::cache::set_page_flip_on_send(prev);
 }
 
 #[test]
@@ -969,6 +1527,7 @@ fn show_usage_on_welcome_screen_is_noop() {
 fn show_usage_with_redirect_url_fetches_session_only() {
     // Redirect link is deferred until SessionUsageComplete (see billing tests).
     let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
     app.usage_billing_redirect_url = Some("https://billing.example.com/me".to_string());
     let before = agent_scrollback_len(&app);
     let effects = dispatch(Action::ShowUsage, &mut app);
@@ -992,7 +1551,7 @@ fn minimal_update_notice_commits_a_system_block() {
     assert_eq!(agent_scrollback_len(&app), before + 1);
     let text = last_system_text(&app, AgentId(0));
     assert!(text.contains("Update available: v9.9.9"), "got: {text:?}");
-    assert!(text.contains("restart to apply"), "got: {text:?}");
+    assert!(text.contains("Restart to apply."), "got: {text:?}");
 }
 
 #[test]
@@ -1004,8 +1563,8 @@ fn minimal_update_notice_no_active_agent_is_noop() {
 
 // ── Tutorial dispatch tests ──────────────────────────────────────────
 
-/// `/tutorial` (and the palette entry) open the overlay; dispatching again
-/// while open toggles it closed. No side effects either way.
+/// `/tutorial` (and the palette entry) open the overlay; dispatching again while open toggles it closed.
+/// No side effects either way.
 #[test]
 fn open_tutorial_toggles_overlay_without_effects() {
     let mut app = test_app();
@@ -1016,4 +1575,210 @@ fn open_tutorial_toggles_overlay_without_effects() {
     let effects = dispatch(Action::OpenTutorial, &mut app);
     assert!(app.tutorial.is_none(), "toggle closes");
     assert!(effects.is_empty(), "close emits nothing, got: {effects:?}");
+}
+
+// ── Usage modal (full TUI) dispatch tests ────────────────────────────
+
+fn usage_modal_state(app: &AppView) -> &crate::views::usage_modal::UsageInfoModalState {
+    match app.agents[&AgentId(0)].active_modal.as_ref() {
+        Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state,
+        _ => panic!("expected the usage modal to be open"),
+    }
+}
+
+#[test]
+fn show_usage_opens_modal_on_usage_limit_tab_with_fetches() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::ShowUsage, &mut app);
+    let state = usage_modal_state(&app);
+    assert_eq!(
+        state.active_tab,
+        crate::views::usage_modal::UsageInfoTab::UsageLimit
+    );
+    assert_eq!(state.ctx.session_id.as_deref(), Some("test-session"));
+    assert!(state.billing_loading);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [
+                Effect::ShowContextInfo { .. },
+                Effect::ShowSessionInfo { .. },
+                Effect::FetchSessionUsage { .. },
+                Effect::FetchBilling { silent: true, .. },
+            ]
+        ),
+        "got: {effects:?}"
+    );
+}
+
+#[test]
+fn show_context_info_retabs_open_modal_without_refetching() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let effects = dispatch(Action::ShowContextInfo, &mut app);
+    assert!(effects.is_empty(), "got: {effects:?}");
+    assert_eq!(
+        usage_modal_state(&app).active_tab,
+        crate::views::usage_modal::UsageInfoTab::ContextUsage
+    );
+}
+
+#[test]
+fn show_session_info_opens_modal_on_session_tab() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowSessionInfo, &mut app);
+    assert_eq!(
+        usage_modal_state(&app).active_tab,
+        crate::views::usage_modal::UsageInfoTab::SessionInfo
+    );
+}
+
+#[test]
+fn usage_results_populate_open_modal_not_scrollback() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let before = agent_scrollback_len(&app);
+
+    let nonce = current_usage_nonce(&app);
+    complete_session_usage(&mut app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionInfoComplete {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            info: Box::new(context_info_response()),
+            text: "  Session ID: test-session".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "test-session".to_string(),
+                compact: false,
+            }],
+            nonce,
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextInfoComplete {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            info: Box::new(context_info_response()),
+            nonce,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(agent_scrollback_len(&app), before);
+    let state = usage_modal_state(&app);
+    assert!(state.session_usage_text.is_some());
+    let fields = state
+        .session_fields
+        .as_ref()
+        .expect("session fields populated");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].value, "test-session");
+    assert!(state.context.is_some());
+}
+
+#[test]
+fn usage_results_without_open_modal_are_dropped_in_full_mode() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    complete_session_usage(&mut app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionInfoFailed {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            error: "boom".to_string(),
+            nonce: Default::default(),
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextInfoFailed {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            error: "boom".to_string(),
+            nonce: Default::default(),
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before);
+}
+
+#[test]
+fn reply_from_previous_modal_open_is_dropped() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let old_nonce = current_usage_nonce(&app);
+    // Close and reopen on the same session: a new fetch generation.
+    app.agents.get_mut(&AgentId(0)).unwrap().active_modal = None;
+    dispatch(Action::ShowUsage, &mut app);
+    assert_ne!(current_usage_nonce(&app), old_nonce);
+    // The first open's reply lands late; it must not populate the modal
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionInfoComplete {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            info: Box::new(context_info_response()),
+            text: "  Session ID: from-old-open".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "from-old-open".to_string(),
+                compact: false,
+            }],
+            nonce: old_nonce,
+        }),
+        &mut app,
+    );
+    assert!(usage_modal_state(&app).session_fields.is_none());
+}
+
+#[test]
+fn stale_session_info_does_not_populate_modal() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowSessionInfo, &mut app);
+    let nonce = current_usage_nonce(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionInfoComplete {
+            agent_id: AgentId(0),
+            session_id: "old-session".into(),
+            info: Box::new(context_info_response()),
+            text: "  Session ID: old-session".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "old-session".to_string(),
+                compact: false,
+            }],
+            nonce,
+        }),
+        &mut app,
+    );
+    assert!(usage_modal_state(&app).session_fields.is_none());
+}
+
+#[test]
+fn fetch_failures_surface_in_open_modal() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let nonce = current_usage_nonce(&app);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionInfoFailed {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            error: "info boom".to_string(),
+            nonce,
+        }),
+        &mut app,
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::ContextInfoFailed {
+            agent_id: AgentId(0),
+            session_id: "test-session".into(),
+            error: "ctx boom".to_string(),
+            nonce,
+        }),
+        &mut app,
+    );
+    let state = usage_modal_state(&app);
+    assert_eq!(state.session_error.as_deref(), Some("info boom"));
+    assert_eq!(state.context_error.as_deref(), Some("ctx boom"));
 }
