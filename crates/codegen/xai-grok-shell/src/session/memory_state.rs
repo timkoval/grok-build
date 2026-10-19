@@ -83,6 +83,8 @@ pub(crate) struct SessionMemory {
     pub dream_count: AtomicU64,
     pub dream_success_count: AtomicU64,
     pub dream_error_count: AtomicU64,
+    /// Last Grokback topic id injected via `topic_retrieval_reminder`. None until first switch.
+    pub last_injected_topic_id: RefCell<Option<String>>,
 }
 
 impl SessionMemory {

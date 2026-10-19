@@ -78,6 +78,9 @@ impl PendingInteractionGuard {
             let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
             map.insert(tool_call_id.clone(), kind);
         }
+        if kind == PendingKind::Permission {
+            write_pending_projection(session_id.0.as_ref(), &tool_call_id);
+        }
         broadcast(
             &gateway,
             &session_id,
@@ -103,6 +106,7 @@ impl Drop for PendingInteractionGuard {
         };
         // First-answer-wins: only announce resolution if this guard actually owned the live entry
         if removed {
+            clear_pending_projection(self.session_id.0.as_ref());
             broadcast(
                 &self.gateway,
                 &self.session_id,
@@ -111,6 +115,55 @@ impl Drop for PendingInteractionGuard {
                 },
             );
         }
+    }
+}
+
+fn session_dir_by_id(id: &str) -> Option<std::path::PathBuf> {
+    let root = crate::util::grok_home::grok_home().join("sessions");
+    fn walk(dir: &std::path::Path, id: &str, depth: u8) -> Option<std::path::PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.file_name().and_then(|n| n.to_str()) == Some(id) {
+                return Some(p);
+            }
+            if let Some(hit) = walk(&p, id, depth - 1) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    walk(&root, id, 3)
+}
+
+fn write_pending_projection(session_id: &str, tool_call_id: &str) {
+    let Some(dir) = session_dir_by_id(session_id) else {
+        return;
+    };
+    let dest = dir.join("pending_permission.json");
+    let tmp = dir.join(".pending_permission.json.tmp");
+    let body = serde_json::json!({
+        "requestId": tool_call_id,
+        "toolCallId": tool_call_id,
+        "toolName": "tool",
+        "summary": tool_call_id,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+    if std::fs::write(&tmp, body.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, dest);
+    }
+}
+
+fn clear_pending_projection(session_id: &str) {
+    if let Some(dir) = session_dir_by_id(session_id) {
+        let _ = std::fs::remove_file(dir.join("pending_permission.json"));
+        let _ = std::fs::remove_file(dir.join(".pending_permission.json.tmp"));
     }
 }
 

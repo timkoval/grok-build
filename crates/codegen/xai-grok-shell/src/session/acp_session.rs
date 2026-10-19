@@ -97,6 +97,8 @@ mod goal;
 mod named_workflow_args;
 #[path = "acp_session_impl/turn.rs"]
 mod turn;
+#[path = "acp_session_impl/grokback_knowledge.rs"]
+mod grokback_knowledge;
 #[path = "acp_session_impl/workflow.rs"]
 mod workflow_run;
 pub(crate) use turn::SUBAGENT_USAGE_DRAIN;

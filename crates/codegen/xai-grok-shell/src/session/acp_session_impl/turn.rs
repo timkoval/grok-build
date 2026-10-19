@@ -2269,6 +2269,51 @@ impl SessionActor {
         );
         crate::session::helpers::memory_context::format_memory_reminder(&inject_results)
     }
+
+    /// Per-topic knowledge window. Independent of `first_turn_memory_reminder`.
+    /// Injects only when `topicId` changed since `last_injected_topic_id` (prompt-cache otherwise).
+    pub(crate) async fn topic_retrieval_reminder(&self) {
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let prompt =
+            crate::session::helpers::session_compact::extract_last_real_user_query(&conversation)
+                .unwrap_or_default();
+        if prompt.is_empty() {
+            return;
+        }
+        let acp = self.session_info.id.to_string();
+        let cwd = self.session_info.cwd.clone();
+        let win = match tokio::task::spawn_blocking(move || {
+            super::grokback_knowledge::turn_window(&acp, &cwd, &prompt)
+        })
+        .await
+        {
+            Ok(w) => w,
+            Err(error) => {
+                tracing::warn!(%error, "grokback knowledge: join failed");
+                return;
+            }
+        };
+        let Some(win) = win else {
+            return;
+        };
+        let last = self.memory.last_injected_topic_id.borrow().clone();
+        if last.as_deref() == Some(win.topic_id.as_str()) {
+            return;
+        }
+        let body = format!(
+            "<grokback-knowledge>\n{}\n</grokback-knowledge>",
+            win.block
+        );
+        self.push_system_reminder(&body);
+        tracing::info!(
+            topic_id = %win.topic_id,
+            topic_label = %win.topic_label,
+            switched = win.switched,
+            "GROKBACK_KNOWLEDGE: topic retrieval injected"
+        );
+        *self.memory.last_injected_topic_id.borrow_mut() = Some(win.topic_id);
+    }
+
     /// Inspect `tool_calls` for a `StructuredOutput` call and decide the turn's next step, pushing the call's `tool_result` as a side effect.
     /// The pushed result is a correction, a retry error, or the terminal answer.
     /// Validates the args against `validator` and bumps `retries` on a non-conforming retry.
@@ -2699,6 +2744,7 @@ impl SessionActor {
                 self.inject_pending_monitor_events().await;
             }
             let memory_reminder = self.first_turn_memory_reminder().await;
+            self.topic_retrieval_reminder().await;
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count
